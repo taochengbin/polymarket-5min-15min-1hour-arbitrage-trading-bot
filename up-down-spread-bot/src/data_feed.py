@@ -11,9 +11,11 @@ import os
 import hmac
 import hashlib
 import base64
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
+from urllib.parse import urlparse
 import trader as trader_module
 from position_tracker import PositionTracker
+from proxy_env import requests_proxies, websocket_proxy_kwargs, resolve_proxy_url
 
 
 class DataFeed:
@@ -31,6 +33,9 @@ class DataFeed:
         self.api_passphrase = os.getenv('POLYMARKET_API_PASSPHRASE')
         
         pm = config.get("data_sources", {}).get("polymarket", {})
+        raw_px = (pm.get("http_proxy") or pm.get("https_proxy") or "").strip()
+        self._proxy_url_override: Optional[str] = raw_px if raw_px else None
+
         self.market_interval_sec = int(pm.get("market_interval_sec", 900))
         if self.market_interval_sec <= 0:
             self.market_interval_sec = 900
@@ -92,6 +97,16 @@ class DataFeed:
         
         # Event-driven callbacks for price updates
         self.price_callbacks = []
+
+        eff = resolve_proxy_url(self._proxy_url_override)
+        if eff:
+            pe = urlparse(eff)
+            src = "config.json data_sources.polymarket.http_proxy" if self._proxy_url_override else "HTTPS_PROXY/HTTP_PROXY env"
+            h, p = pe.hostname or "?", pe.port or ("443" if (pe.scheme or "").lower() == "https" else "80")
+            print(f"[DATA] Polymarket proxy active ({src}) → host {h} port {p} (REST + WS MARKET)")
+        _ws_px = websocket_proxy_kwargs(self._proxy_url_override)
+        if eff and not _ws_px:
+            print("[DATA] ⚠️ Proxy URL set but WebSocket kwargs empty (check scheme: use http://127.0.0.1:PORT).")
     
     def start(self):
         """Start data streams for BTC, ETH, SOL, XRP + User Channel"""
@@ -179,7 +194,11 @@ class DataFeed:
             
             # Use events API with specific slug
             url = f"{gamma_api}/events?slug={slug}"
-            resp = requests.get(url, timeout=10)
+            proxies = requests_proxies(self._proxy_url_override)
+            req_kw: Dict[str, Any] = {"timeout": 10}
+            if proxies:
+                req_kw["proxies"] = proxies
+            resp = requests.get(url, **req_kw)
             resp.raise_for_status()
             
             events = resp.json()
@@ -281,17 +300,23 @@ class DataFeed:
                 ws = websocket.WebSocketApp(
                     ws_url,
                     on_message=lambda ws, msg: self._on_pm_message(msg, tokens, coin),
-                    on_error=lambda ws, err: None,
-                    on_close=lambda ws, code, reason: None
+                    on_error=lambda ws, err, _c=coin: (
+                        print(f"[PM-{_c.upper()}] WebSocket error: {err!r}") if err else None
+                    ),
+                    on_close=lambda ws, code, reason, _c=coin: (
+                        print(f"[PM-{_c.upper()}] WebSocket closed code={code} reason={reason!r}")
+                        if code is not None and int(code) != 1000
+                        else None
+                    ),
                 )
                 
                 ws_ref[0] = ws
                 
                 def on_open(ws):
+                    # Polymarket docs: type must be lowercase "market" (not "MARKET").
                     sub_msg = {
-                        "auth": {},
-                        "type": "MARKET",
-                        "assets_ids": [tokens["up"], tokens["down"]]
+                        "type": "market",
+                        "assets_ids": [tokens["up"], tokens["down"]],
                     }
                     ws.send(json.dumps(sub_msg))
                 
@@ -310,8 +335,14 @@ class DataFeed:
                 
                 stop_checker = threading.Thread(target=check_stop, daemon=True)
                 stop_checker.start()
-                
-                ws.run_forever(ping_interval=20, ping_timeout=10, skip_utf8_validation=True)
+
+                _px = websocket_proxy_kwargs(self._proxy_url_override)
+                ws.run_forever(
+                    ping_interval=20,
+                    ping_timeout=10,
+                    skip_utf8_validation=True,
+                    **_px,
+                )
                 timer.cancel()
                 
                 # Stop immediately if stop_event is set
@@ -561,7 +592,8 @@ class DataFeed:
                 ws.on_open = on_open
                 
                 # Run forever (blocking call)
-                ws.run_forever()
+                _px = websocket_proxy_kwargs(self._proxy_url_override)
+                ws.run_forever(**_px)
                 
             except Exception as e:
                 print(f"[USER-WS] ⚠️  Exception: {e}")

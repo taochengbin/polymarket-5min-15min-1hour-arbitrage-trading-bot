@@ -125,7 +125,8 @@
     "polymarket": {
       "gamma_api": "https://gamma-api.polymarket.com",
       "ws_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
-      "market_window": "15m"
+      "market_window": "15m",
+      "http_proxy": ""
     }
   },
   "display": {

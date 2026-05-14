@@ -6,6 +6,8 @@ import requests
 import json
 from typing import Optional, Dict
 
+from proxy_env import requests_proxies_from_environ
+
 GAMMA_API = "https://gamma-api.polymarket.com"
 
 def get_market_outcome(slug: str, timeout: int = 10) -> Dict:
@@ -23,7 +25,11 @@ def get_market_outcome(slug: str, timeout: int = 10) -> Dict:
     """
     try:
         url = f"{GAMMA_API}/events?slug={slug}"
-        resp = requests.get(url, timeout=timeout)
+        proxies = requests_proxies_from_environ()
+        req_kw = {"timeout": timeout}
+        if proxies:
+            req_kw["proxies"] = proxies
+        resp = requests.get(url, **req_kw)
         resp.raise_for_status()
         
         events = resp.json()

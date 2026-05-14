@@ -252,7 +252,18 @@ def main(args=None):
     global stop_flag, data_feed, wallet_balance, keyboard_listener
     if args is None:
         args = _parse_cli_args()
-    
+
+    # Load .env before DataFeed so HTTPS_PROXY / HTTP_PROXY apply in dry_run too
+    # (OrderExecutor only loads .env when not dry_run.)
+    _proj_env = Path(__file__).resolve().parent.parent / ".env"
+    if _proj_env.is_file():
+        try:
+            from dotenv import load_dotenv
+
+            load_dotenv(_proj_env, override=False)
+        except Exception:
+            pass
+
     # Track session start time for uptime
     session_start_time = time.time()
     
