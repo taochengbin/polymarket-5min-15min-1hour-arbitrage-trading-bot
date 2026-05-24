@@ -58,10 +58,15 @@ def create_app(project_root: Path | None = None) -> Flask:
         import web_dashboard_state as wds
 
         snap = wds.get_snapshot()
-        if snap.get("status") == "initializing" or not snap.get("coins"):
-            file_snap = wds.read_state_file(root)
+        file_snap = wds.read_state_file(root)
+        live_ok = snap.get("status") == "running" and bool(snap.get("coins"))
+        if not live_ok:
             if file_snap:
                 return jsonify(file_snap)
+            return jsonify(snap)
+        if not snap.get("recent_trades") and file_snap and file_snap.get("recent_trades"):
+            snap = dict(snap)
+            snap["recent_trades"] = file_snap["recent_trades"]
         return jsonify(snap)
 
     @app.route("/api/config", methods=["GET"])
@@ -102,6 +107,114 @@ def create_app(project_root: Path | None = None) -> Flask:
 
         wds.request_stop()
         return jsonify({"ok": True, "message": "Stop requested — bot will shut down gracefully."})
+
+    @app.route("/api/trades")
+    def api_trades():
+        import web_dashboard_state as wds
+        from web_dashboard.snapshot_builder import (
+            filter_trades_by_entry_date,
+            query_trades_paginated,
+        )
+
+        page = request.args.get("page", 1, type=int)
+        page_size = request.args.get("page_size", 20, type=int)
+        if page_size not in (10, 20, 50):
+            page_size = 20
+        date_from = (request.args.get("date_from") or "").strip() or None
+        date_to = (request.args.get("date_to") or "").strip() or None
+
+        ctx = wds.get_bot_context()
+        if ctx and ctx.get("multi_trader"):
+            payload = query_trades_paginated(
+                multi_trader=ctx["multi_trader"],
+                strategy_base=ctx["strategy_base"],
+                coins=ctx["coins"],
+                data_feed=ctx.get("data_feed"),
+                market_windows=ctx.get("market_windows"),
+                market_starts=ctx.get("market_starts"),
+                page=page,
+                page_size=page_size,
+                date_from=date_from,
+                date_to=date_to,
+                read_trade_files=True,
+            )
+            return jsonify(payload)
+
+        snap = wds.get_snapshot()
+        file_snap = wds.read_state_file(root)
+        rows = list(snap.get("recent_trades") or [])
+        if not rows and file_snap:
+            rows = list(file_snap.get("recent_trades") or [])
+        filtered = filter_trades_by_entry_date(rows, date_from, date_to)
+        total = len(filtered)
+        page = max(1, page)
+        page_size = max(1, min(100, page_size))
+        start = (page - 1) * page_size
+        items = filtered[start : start + page_size]
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        return jsonify(
+            {
+                "items": items,
+                "total": total,
+                "page": page,
+                "page_size": page_size,
+                "total_pages": total_pages,
+                "pending_settlement_count": sum(
+                    1
+                    for t in rows
+                    if t.get("is_open") or t.get("settlement_pending")
+                ),
+                "date_from": date_from or "",
+                "date_to": date_to or "",
+                "offline": True,
+            }
+        )
+
+    @app.route("/api/trades/settle-pending", methods=["POST"])
+    def api_settle_pending():
+        import web_dashboard_state as wds
+        from settlement_service import settle_all_pending
+
+        ctx = wds.get_bot_context()
+        if not ctx or not ctx.get("multi_trader"):
+            return jsonify(
+                {
+                    "ok": False,
+                    "error": "Bot not running with --web; start main.py --web first.",
+                }
+            ), 503
+
+        body = request.get_json(silent=True) if request.is_json else {}
+        if not isinstance(body, dict):
+            body = {}
+        limit_raw = body.get("limit")
+        limit: int | None = None
+        if limit_raw is not None and str(limit_raw).strip() != "":
+            try:
+                limit = int(limit_raw)
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": "limit must be a positive integer"}), 400
+            if limit <= 0:
+                return jsonify({"ok": False, "error": "limit must be >= 1"}), 400
+            limit = min(limit, 100)
+
+        try:
+            result = settle_all_pending(
+                multi_trader=ctx["multi_trader"],
+                strategy_base=ctx["strategy_base"],
+                coins=ctx["coins"],
+                proxy_url=ctx.get("proxy_url"),
+                lock_chainlink_window=ctx.get("lock_chainlink_window"),
+                market_window_prices=ctx.get("market_windows"),
+                delay_sec=0.0,
+                limit=limit,
+            )
+            refresh = ctx.get("refresh_trades")
+            if callable(refresh):
+                refresh()
+            return jsonify({"ok": True, **result})
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 500
 
     return app
 

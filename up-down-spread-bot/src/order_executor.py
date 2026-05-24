@@ -14,9 +14,18 @@ import concurrent.futures
 
 from web3 import Web3
 from eth_account import Account
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import (
+    OrderArgs,
+    MarketOrderArgs,
+    OrderType,
+    BalanceAllowanceParams,
+    AssetType,
+)
+from py_clob_client_v2.order_builder.constants import BUY, SELL
+from py_clob_client_v2.order_utils import SignatureTypeV2
+from py_builder_relayer_client.config import get_contract_config
+from py_builder_relayer_client.builder.derive import derive_deposit_wallet
 
 from safety_guard import SafetyGuard
 import logging
@@ -107,6 +116,7 @@ class OrderExecutor:
         # Initialize CLOB client
         self.client = None
         self.wallet_address = None
+        self.signature_type = SignatureTypeV2.EOA
         
         if not self.safety.dry_run:
             try:
@@ -123,30 +133,55 @@ class OrderExecutor:
                 
                 # Read signature type and funder address
                 signature_type = int(os.getenv("SIGNATURE_TYPE", "0"))
-                funder_address = os.getenv("FUNDER_ADDRESS", "")
-                
-                # Get wallet address based on SIGNATURE_TYPE
-                # Type 0: Use address from PRIVATE_KEY (standard EOA wallet)
-                # Type 1/2: Use FUNDER_ADDRESS (Polymarket proxy/smart contract wallet)
-                if signature_type == 0:
-                    self.wallet_address = Account.from_key(self.private_key).address
+                funder_address = (os.getenv("FUNDER_ADDRESS") or "").strip()
+                eoa_address = Account.from_key(self.private_key).address
+
+                host = os.getenv("CLOB_HOST", "https://clob.polymarket.com")
+                chain_id = int(os.getenv("CHAIN_ID", "137"))
+
+                # Detect Polymarket deposit wallet (CLOB v2 / POLY_1271)
+                relayer_cfg = get_contract_config(chain_id)
+                deposit_wallet = derive_deposit_wallet(
+                    eoa_address,
+                    relayer_cfg.deposit_wallet_factory,
+                    relayer_cfg.deposit_wallet_implementation,
+                )
+                if funder_address and funder_address.lower() == deposit_wallet.lower():
+                    if signature_type != SignatureTypeV2.POLY_1271:
+                        print(
+                            "[EXECUTOR] ⚠ FUNDER is a deposit wallet — "
+                            f"overriding SIGNATURE_TYPE {signature_type} → 3 (POLY_1271)"
+                        )
+                    signature_type = SignatureTypeV2.POLY_1271
+                self.signature_type = signature_type
+
+                # Resolve wallet address used for balance queries and order maker
+                if signature_type == SignatureTypeV2.EOA:
+                    self.wallet_address = eoa_address
                     wallet_type = "EOA"
                 else:
                     if not funder_address:
-                        raise ValueError(f"SIGNATURE_TYPE={signature_type} requires FUNDER_ADDRESS in .env")
+                        if signature_type == SignatureTypeV2.POLY_1271:
+                            funder_address = deposit_wallet
+                        else:
+                            raise ValueError(
+                                f"SIGNATURE_TYPE={signature_type} requires FUNDER_ADDRESS in .env"
+                            )
                     self.wallet_address = funder_address
-                    wallet_type = f"Proxy (type {signature_type})"
-                
-                host = os.getenv("CLOB_HOST", "https://clob.polymarket.com")
-                chain_id = int(os.getenv("CHAIN_ID", "137"))
-                
-                # Initialize ClobClient with signature type and funder if needed
-                if signature_type == 0:
+                    if signature_type == SignatureTypeV2.POLY_1271:
+                        wallet_type = "Deposit wallet (POLY_1271)"
+                    elif signature_type == SignatureTypeV2.POLY_GNOSIS_SAFE:
+                        wallet_type = "Gnosis Safe (type 2)"
+                    else:
+                        wallet_type = f"Proxy (type {signature_type})"
+
+                # Initialize ClobClient
+                if signature_type == SignatureTypeV2.EOA:
                     self.client = ClobClient(
                         host=host,
                         chain_id=chain_id,
                         key=self.private_key,
-                        signature_type=0
+                        signature_type=signature_type,
                     )
                 else:
                     self.client = ClobClient(
@@ -154,14 +189,33 @@ class OrderExecutor:
                         chain_id=chain_id,
                         key=self.private_key,
                         signature_type=signature_type,
-                        funder=funder_address
+                        funder=funder_address,
                     )
                 # 🚨 CRITICAL: Generate and set API credentials
                 print(f"[EXECUTOR] Generating API credentials...")
-                creds = self.client.create_or_derive_api_creds()
+                creds = self.client.create_or_derive_api_key()
                 self.client.set_api_creds(creds)
-                print(f"[EXECUTOR] ✓ API credentials set")
-                
+                print(f"[EXECUTOR] ✓ API credentials set (CLOB v2 client)")
+
+                # Sync CLOB balance/allowance cache (required for deposit wallets)
+                try:
+                    self.client.update_balance_allowance(
+                        BalanceAllowanceParams(
+                            asset_type=AssetType.COLLATERAL,
+                            signature_type=signature_type,
+                        )
+                    )
+                    ba = self.client.get_balance_allowance(
+                        BalanceAllowanceParams(
+                            asset_type=AssetType.COLLATERAL,
+                            signature_type=signature_type,
+                        )
+                    )
+                    clob_cash = int(ba.get("balance", "0")) / 1e6
+                    print(f"[EXECUTOR] ✓ CLOB Cash synced: ${clob_cash:.2f}")
+                except Exception as sync_err:
+                    print(f"[EXECUTOR] ⚠ CLOB balance sync failed: {sync_err}")
+
                 print(f"[EXECUTOR] ✓ CLOB client initialized")
                 print(f"[EXECUTOR]    Wallet: {self.wallet_address[:6]}...{self.wallet_address[-4:]}")
                 print(f"[EXECUTOR]    Type: {wallet_type}")
@@ -209,9 +263,10 @@ class OrderExecutor:
              "stateMutability": "view", "type": "function"}
         ]
         
-        # USDC contracts
+        # USDC / pUSD (Polymarket CLOB v2 collateral)
         self.USDC_BRIDGED = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
         self.USDC_NATIVE = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
+        self.PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
         self.ERC20_ABI = [
             {'constant': True, 'inputs': [{'name': '_owner', 'type': 'address'}], 
              'name': 'balanceOf', 'outputs': [{'name': 'balance', 'type': 'uint256'}], 'type': 'function'},
@@ -251,6 +306,14 @@ class OrderExecutor:
         """
         self.market_closing_check_callback = callback
         print("[EXECUTOR] ✓ Market closing check callback registered")
+
+    def _create_and_post_order(self, order_args: OrderArgs, order_type: OrderType):
+        """Create and post limit order using CLOB v2."""
+        return self.client.create_and_post_order(order_args, order_type=order_type)
+
+    def _create_and_post_market_order(self, order_args: MarketOrderArgs, order_type: OrderType):
+        """Create and post market order using CLOB v2 (FAK/FOK BUY must use USD amount)."""
+        return self.client.create_and_post_market_order(order_args, order_type=order_type)
     
     def _log_redeem(self, market_slug: str, success: bool, amount: float, tx_hash: str = "", reason: str = ""):
         """Log redeem operation to separate file"""
@@ -268,50 +331,64 @@ class OrderExecutor:
         except Exception as e:
             print(f"[ERROR] Failed to log redeem: {e}")
     
+    def _read_erc20_balance(self, w3: Web3, token_address: str, owner: str) -> float:
+        """Read ERC20 balance for owner; returns 0.0 if token call fails."""
+        try:
+            contract = w3.eth.contract(
+                address=Web3.to_checksum_address(token_address),
+                abi=self.ERC20_ABI,
+            )
+            raw = contract.functions.balanceOf(Web3.to_checksum_address(owner)).call()
+            decimals = contract.functions.decimals().call()
+            return raw / (10 ** decimals)
+        except Exception:
+            return 0.0
+
     def get_wallet_usdc_balance(self) -> Optional[float]:
         """
-        Get wallet USDC balance (bridged + native)
-        Copy of method from /root/clip/trade.py
+        Get wallet trading collateral: USDC.e + native USDC + pUSD (Polymarket CLOB v2 Cash).
         """
         try:
             if not self.wallet_address and self.private_key:
                 self.wallet_address = Account.from_key(self.private_key).address
-            
+
             if not self.wallet_address:
                 print("[EXECUTOR] ❌ No wallet address")
                 return None
-            
-            # Use first RPC endpoint for wallet balance queries
-            rpc_url = self.rpc_endpoints[0] if self.rpc_endpoints else "https://polygon-rpc.com"
-            w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={'timeout': self.rpc_single_timeout}))
-            
-            if not w3.is_connected():
-                print("[EXECUTOR] ⚠ Cannot connect to RPC")
-                return None
-            
-            total = 0.0
-            
-            # USDC.e (bridged) - main Polymarket token
-            usdc_e = w3.eth.contract(
-                address=Web3.to_checksum_address(self.USDC_BRIDGED), 
-                abi=self.ERC20_ABI
-            )
-            balance_e = usdc_e.functions.balanceOf(self.wallet_address).call()
-            decimals_e = usdc_e.functions.decimals().call()
-            total += balance_e / (10 ** decimals_e)
-            
-            # Native USDC
-            usdc_n = w3.eth.contract(
-                address=Web3.to_checksum_address(self.USDC_NATIVE), 
-                abi=self.ERC20_ABI
-            )
-            balance_n = usdc_n.functions.balanceOf(self.wallet_address).call()
-            decimals_n = usdc_n.functions.decimals().call()
-            total += balance_n / (10 ** decimals_n)
-            
-            print(f"[EXECUTOR] Wallet balance: ${total:.2f}")
-            return total
-            
+
+            rpc_list = self.rpc_endpoints or [os.getenv("RPC_URL", "https://polygon-rpc.com")]
+            last_error = None
+
+            for rpc_url in rpc_list:
+                try:
+                    w3 = Web3(Web3.HTTPProvider(
+                        rpc_url,
+                        request_kwargs={'timeout': self.rpc_single_timeout},
+                    ))
+                    if not w3.is_connected():
+                        continue
+
+                    owner = Web3.to_checksum_address(self.wallet_address)
+                    usdc_e = self._read_erc20_balance(w3, self.USDC_BRIDGED, owner)
+                    usdc_n = self._read_erc20_balance(w3, self.USDC_NATIVE, owner)
+                    pusd = self._read_erc20_balance(w3, self.PUSD, owner)
+                    total = usdc_e + usdc_n + pusd
+
+                    rpc_short = rpc_url.split('/')[2][:30] if '://' in rpc_url else rpc_url[:30]
+                    print(
+                        f"[EXECUTOR] Wallet balance @ {rpc_short}: "
+                        f"USDC.e=${usdc_e:.2f} USDC=${usdc_n:.2f} pUSD=${pusd:.2f} → total=${total:.2f}"
+                    )
+                    return total
+                except Exception as e:
+                    last_error = e
+                    continue
+
+            print(f"[EXECUTOR] ⚠ Cannot connect to any RPC ({len(rpc_list)} tried)")
+            if last_error:
+                print(f"[EXECUTOR] ❌ Balance query error: {last_error}")
+            return None
+
         except Exception as e:
             print(f"[EXECUTOR] ❌ Balance query error: {e}")
             return None
@@ -666,30 +743,30 @@ class OrderExecutor:
                     print(f"[EXECUTOR] ✅ BUY TARGET REACHED: {total_filled_contracts:.2f}/{target_contracts} ({fill_pct:.1f}%)")
                     break
                 
-                # 🚨 CRITICAL: Convert contracts to DOLLARS!
+                # FAK BUY: amount must be USD (2 decimals), not contracts — see CLOB market buy rules
                 remaining_usd = remaining_contracts * normalized_price
-                order_size_usd = round(remaining_usd, 2)  # Round to 2 decimals!
+                order_size_usd = round(remaining_usd, 2)
                 
                 # 🚨 Minimum $1.00
                 if order_size_usd < MIN_ORDER_USD:
                     print(f"[EXECUTOR] ⚠ Remaining ${order_size_usd:.2f} < ${MIN_ORDER_USD:.2f} minimum, stopping")
                     break
                 
-                log_buy_attempt(market_slug, side, round(remaining_contracts, 2), normalized_price, fak_attempt, MAX_FAK_ATTEMPTS)
-                print(f"[EXECUTOR] [FAK {fak_attempt}/{MAX_FAK_ATTEMPTS}] Ordering {round(remaining_contracts, 2)} contracts of {side} @ ${normalized_price:.2f} (=${order_size_usd:.2f})")
+                est_contracts = round(order_size_usd / normalized_price, 4)
+                log_buy_attempt(market_slug, side, est_contracts, normalized_price, fak_attempt, MAX_FAK_ATTEMPTS)
+                print(f"[EXECUTOR] [FAK {fak_attempt}/{MAX_FAK_ATTEMPTS}] Buying ${order_size_usd:.2f} of {side} @ ${normalized_price:.2f} (~{est_contracts:.2f} contracts)")
                 
                 start_time = time.time()
                 
-                # Create FAK order (size in DOLLARS!)
-                order_args = OrderArgs(
-                    price=normalized_price,
-                    size=round(remaining_contracts, 2),  # 🚨 IN CONTRACTS!
-                    side=BUY,
+                order_args = MarketOrderArgs(
                     token_id=token_id,
+                    amount=order_size_usd,
+                    side=BUY,
+                    price=normalized_price,
+                    order_type=OrderType.FAK,
                 )
                 
-                signed_order = self.client.create_order(order_args)
-                api_result = self.client.post_order(signed_order, OrderType.FAK)
+                api_result = self._create_and_post_market_order(order_args, OrderType.FAK)
                 
                 elapsed_ms = int((time.time() - start_time) * 1000)
                 
@@ -733,7 +810,7 @@ class OrderExecutor:
                     error_msg = api_result.get("errorMsg", "Unknown")
                     print(f"[EXECUTOR] ⚠ [FAK {fak_attempt}] FAILED: {error_msg}")
                     print(f"[EXECUTOR]   🔍 Full API response: {json.dumps(api_result, indent=2)}")
-                    print(f"[EXECUTOR]   📋 Sent OrderArgs: price=${sell_price:.2f}, size={remaining_contracts:.2f} contracts, side=SELL, token={token_id}")
+                    print(f"[EXECUTOR]   📋 Sent MarketOrderArgs: price=${normalized_price:.2f}, amount=${order_size_usd:.2f}, side=BUY, token={token_id}")
                 
                 # Pause before next FAK attempt
                 if fak_attempt < MAX_FAK_ATTEMPTS:
@@ -953,8 +1030,7 @@ class OrderExecutor:
                         token_id=token_id,
                     )
                     
-                    signed_order = self.client.create_order(order_args)
-                    api_result = self.client.post_order(signed_order, OrderType.FOK)  # 🔥 FOK!
+                    api_result = self._create_and_post_order(order_args, OrderType.FOK)  # 🔥 FOK!
                     
                     attempt_elapsed = int((time.time() - attempt_start) * 1000)
                     
@@ -1149,8 +1225,7 @@ class OrderExecutor:
                         token_id=token_id,
                     )
                     
-                    signed_order = self.client.create_order(order_args)
-                    api_result = self.client.post_order(signed_order, OrderType.FOK)
+                    api_result = self._create_and_post_order(order_args, OrderType.FOK)
                     
                     sweep_elapsed = int((time.time() - sweep_start) * 1000)
                     
@@ -1344,8 +1419,7 @@ class OrderExecutor:
                             token_id=token_id,
                         )
                         
-                        signed_order = self.client.create_order(order_args)
-                        api_result = self.client.post_order(signed_order, OrderType.FAK)  # 🔥 FAK!
+                        api_result = self._create_and_post_order(order_args, OrderType.FAK)  # 🔥 FAK!
                         
                         fak_elapsed = int((time.time() - fak_start) * 1000)
                         
@@ -1442,8 +1516,7 @@ class OrderExecutor:
                                 token_id=token_id,
                             )
                             
-                            signed_order = self.client.create_order(order_args)
-                            api_result = self.client.post_order(signed_order, OrderType.GTC)  # 🔥 GTC = Market!
+                            api_result = self._create_and_post_order(order_args, OrderType.GTC)  # 🔥 GTC = Market!
                             
                             market_elapsed = int((time.time() - market_start) * 1000)
                             
@@ -1576,8 +1649,7 @@ class OrderExecutor:
                             token_id=token_id,
                         )
                         
-                        signed_order = self.client.create_order(order_args)
-                        api_result = self.client.post_order(signed_order, OrderType.FOK)
+                        api_result = self._create_and_post_order(order_args, OrderType.FOK)
                         
                         fok_elapsed = int((time.time() - fok_start) * 1000)
                         
@@ -1665,8 +1737,7 @@ class OrderExecutor:
                                 token_id=token_id,
                             )
                             
-                            signed_order = self.client.create_order(order_args)
-                            api_result = self.client.post_order(signed_order, OrderType.FAK)
+                            api_result = self._create_and_post_order(order_args, OrderType.FAK)
                             
                             fak_elapsed = int((time.time() - fak_start) * 1000)
                             
@@ -1747,8 +1818,7 @@ class OrderExecutor:
                                 token_id=token_id,
                             )
                             
-                            signed_order = self.client.create_order(order_args)
-                            api_result = self.client.post_order(signed_order, OrderType.GTC)
+                            api_result = self._create_and_post_order(order_args, OrderType.GTC)
                             
                             market_elapsed = int((time.time() - market_start) * 1000)
                             
@@ -1928,6 +1998,7 @@ class OrderExecutor:
             'market_slug': market_slug,
             'side': order_type,
             'order_type': order_type,
+            'token_side': side,
             'fak_attempt': fak_attempt,
             'contracts': contracts,
             'price': price,
@@ -2000,7 +2071,7 @@ class OrderExecutor:
             ]
             
             # Get wallet address
-            wallet_address = self.client.creds.address
+            wallet_address = self.wallet_address
             print(f"[REDEEM] Wallet: {wallet_address}")
             
             # TODO: Complete redeem implementation
@@ -2050,6 +2121,7 @@ class OrderExecutor:
             'market_slug': market_slug,
             'side': side,
             'order_type': order_type,  # BUY or SELL
+            'token_side': side,
             'fak_attempt': fak_attempt,  # FAK attempt number
             'contracts': contracts,
             'price': price,

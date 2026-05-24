@@ -4,6 +4,7 @@
 py-clob-client>=0.16.0
 
 # Web3 for blockchain interactions
+bitarray>=2.4.0
 web3>=6.0.0
 eth-account>=0.10.0
 

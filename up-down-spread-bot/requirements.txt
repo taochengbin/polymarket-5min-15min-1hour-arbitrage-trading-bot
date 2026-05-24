@@ -1,5 +1,6 @@
 # Trading & Blockchain
-py-clob-client>=0.20.0
+py-clob-client-v2>=1.0.1
+py-builder-relayer-client>=0.0.2rc1
 web3>=6.0.0
 eth-account>=0.9.0
 

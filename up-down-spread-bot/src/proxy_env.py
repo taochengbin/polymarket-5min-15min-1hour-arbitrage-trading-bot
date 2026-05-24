@@ -7,6 +7,18 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 
+def normalize_proxy_url(url: str) -> str:
+    """
+    Ensure a parseable URL for requests / websocket-client.
+    Values like ``127.0.0.1:58591`` (no scheme) yield hostname=None in urlparse
+    and break WebSocket proxy — prepend http://.
+    """
+    u = str(url).strip()
+    if not u or "://" in u:
+        return u
+    return "http://" + u
+
+
 def proxy_url_from_environ() -> Optional[str]:
     """First non-empty proxy URL from common env vars."""
     for key in (
@@ -19,14 +31,14 @@ def proxy_url_from_environ() -> Optional[str]:
     ):
         val = os.environ.get(key)
         if val and str(val).strip():
-            return str(val).strip()
+            return normalize_proxy_url(str(val).strip())
     return None
 
 
 def resolve_proxy_url(override: Optional[str] = None) -> Optional[str]:
     """Prefer non-empty `override` (e.g. from config.json), else environment."""
     if override is not None and str(override).strip():
-        return str(override).strip()
+        return normalize_proxy_url(str(override).strip())
     return proxy_url_from_environ()
 
 

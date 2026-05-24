@@ -40,17 +40,25 @@ class MultiTrader:
         for name in strategy_names:
             log_dir = project_root / "logs" / name
             log_dir.mkdir(parents=True, exist_ok=True)
-            self.traders[name] = Trader(capital=capital_per_strategy, log_dir=str(log_dir), config=config)
+            self.traders[name] = Trader(
+                capital=capital_per_strategy,
+                log_dir=str(log_dir),
+                config=config,
+                coin=name.split("_")[-1] if "_" in name else None,
+            )
             print(f"[MULTI-TRADER] Initialized {name} with ${capital_per_strategy:,.0f}")
         
         print(f"[MULTI-TRADER] Total portfolio: ${len(self.traders) * capital_per_strategy:,.0f}")
     
     def enter_position(self, strategy_name: str, market_slug: str, side: str, 
-                      price: float, contracts: int,
+                      price: float, contracts: float,
                       up_ask: float = None, down_ask: float = None,
                       winner_ratio: float = 0.0, is_recovery: bool = False,
                       entry_reason: str = 'normal',
-                      seconds_till_end: int = 0, time_from_start: int = 0) -> bool:
+                      seconds_till_end: int = 0, time_from_start: int = 0,
+                      spot_at_entry: float = 0,
+                      market_spot_open: float = 0,
+                      prefill_buy_result=None) -> bool:
         """
         Enter position for specific strategy (isolated)
         
@@ -88,14 +96,25 @@ class MultiTrader:
                 is_recovery=is_recovery,
                 entry_reason=entry_reason,
                 seconds_till_end=seconds_till_end,
-                time_from_start=time_from_start
+                time_from_start=time_from_start,
+                spot_at_entry=spot_at_entry,
+                market_spot_open=market_spot_open,
+                prefill_buy_result=prefill_buy_result,
             )
         except Exception as e:
             print(f"[ERROR] {strategy_name} entry failed: {e}")
             return False
     
-    def close_market(self, strategy_name: str, market_slug: str, 
-                     winner: str, btc_start: float, btc_final: float) -> Optional[Dict]:
+    def close_market(
+        self,
+        strategy_name: str,
+        market_slug: str,
+        winner: str,
+        btc_start: float,
+        btc_final: float,
+        *,
+        skip_official_fetch: bool = False,
+    ) -> Optional[Dict]:
         """
         Close market for specific strategy (isolated)
         
@@ -119,7 +138,8 @@ class MultiTrader:
                 market_slug=market_slug,
                 winner=winner,
                 btc_start=btc_start,
-                btc_final=btc_final
+                btc_final=btc_final,
+                skip_official_fetch=skip_official_fetch,
             )
         except Exception as e:
             print(f"[ERROR] {strategy_name} close failed: {e}")
@@ -127,7 +147,10 @@ class MultiTrader:
     
     def close_market_early_exit(self, strategy_name: str, market_slug: str, 
                                 exit_price: float, exit_reason: str = 'early_exit',
-                                up_bid: float = None, down_bid: float = None) -> Optional[Dict]:
+                                up_bid: float = None, down_bid: float = None,
+                                keep_market_open_for_reentry: bool = False,
+                                skip_exchange_sell: bool = False,
+                                parallel_sell_results=None) -> Optional[Dict]:
         """
         Close market with early exit for specific strategy
         
@@ -153,7 +176,10 @@ class MultiTrader:
                 exit_price=exit_price,
                 exit_reason=exit_reason,
                 up_bid=up_bid,
-                down_bid=down_bid
+                down_bid=down_bid,
+                keep_market_open_for_reentry=keep_market_open_for_reentry,
+                skip_exchange_sell=skip_exchange_sell,
+                parallel_sell_results=parallel_sell_results,
             )
         except Exception as e:
             print(f"[ERROR] {strategy_name} early exit failed: {e}")

@@ -1,7 +1,7 @@
 {
   "safety": {
     "dry_run": true,
-    "max_order_size_usd": 150.0,
+    "max_order_size_usd": 10.0,
     "max_orders_per_minute": 100,
     "max_total_investment": 1000.0
   },
@@ -25,12 +25,19 @@
   },
   "strategy": {
     "name": "late_entry_v3",
-    "entry_window_sec": 240,
-    "entry_frequency_sec": 7,
-    "min_confidence": 0.30,
+    "entry_window_sec": 120,
+    "entry_frequency_sec": 2,
+    "min_confidence": 0.6,
     "max_spread": 1.05,
     "price_max": 0.92,
-    "max_investment_per_market": 300,
+    "min_spot_move_usd": 0,
+    "min_window_range_usd": 15,
+    "window_range_sample_sec": 5,
+    "window_range_monitor_sec": 180,
+    "max_entries_per_market": 1,
+    "entry_order_usd": 5,
+    "max_investment_per_market": 10,
+    "settlement_fetch_delay_sec": 5,
     "sizing": {
       "above_180_sec": 8,
       "above_120_sec": 10,
@@ -41,7 +48,12 @@
     "flip_stop": {
       "enabled": true,
       "price_threshold": 0.48,
-      "check_realtime": true
+      "max_spot_distance_from_open_usd": 10,
+      "check_realtime": true,
+      "reverse_entry_enabled": true,
+      "reverse_entry_usd": 5,
+      "reverse_entry_price": 0.35,
+      "reverse_stop_price_threshold": 0.35
     },
     "stop_loss": {
       "enabled": true,
@@ -122,11 +134,15 @@
     }
   },
   "data_sources": {
+    "spot_price_source": "chainlink",
     "polymarket": {
       "gamma_api": "https://gamma-api.polymarket.com",
       "ws_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
-      "market_window": "15m",
-      "http_proxy": ""
+      "rtds_ws_url": "wss://ws-live-data.polymarket.com",
+      "market_window": "5m",
+      "chainlink_open_fetch_delay_sec": 30,
+      "http_proxy": "",
+      "websocket_custom_features": false
     }
   },
   "display": {

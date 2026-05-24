@@ -15,25 +15,30 @@ import os
 import threading
 import requests
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict
 from concurrent.futures import ThreadPoolExecutor
 
 from data_feed import DataFeed
 from strategy import LateEntryStrategy
 from multi_trader import MultiTrader
 from dashboard_multi_ab import DashboardMultiAB
-from polymarket_api import get_market_outcome
+from polymarket_api import get_market_outcome, wait_for_official_settlement
 from telegram_notifier import get_notifier
 from safety_guard import SafetyGuard
 from order_executor import OrderExecutor
 from keyboard_listener import KeyboardListener
-from market_config import apply_market_window_settings
+from market_config import apply_market_window_settings, enabled_coins_from_config
 import trader as trader_module
+from trader import enrich_trade_record, apply_official_bet_result
+from spot_price import fetch_coin_spot_usd, fetch_spot_usd, spot_price_source_from_config
+from flip_reverse import execute_flip_stop_sell_only
+from reverse_entry import maybe_reverse_hedge_entry
+from window_range_tracker import WindowRangeTracker
 
 
 # Global configuration constants
 STRATEGY_BASES = ['late_v3']
-COINS = ['btc', 'eth', 'sol', 'xrp']
+COINS: list = []  # set at startup from config trading.*.enabled
 
 # Global stop flag
 stop_flag = False
@@ -249,7 +254,7 @@ def run_manual_redeem():
 
 def main(args=None):
     """Main trading loop"""
-    global stop_flag, data_feed, wallet_balance, keyboard_listener
+    global stop_flag, data_feed, wallet_balance, keyboard_listener, COINS
     if args is None:
         args = _parse_cli_args()
 
@@ -268,16 +273,23 @@ def main(args=None):
     session_start_time = time.time()
     
     config = load_config()
+    COINS = enabled_coins_from_config(config)
+    if not COINS:
+        print("[ERROR] No coins enabled — set trading.{coin}.enabled=true in config.json")
+        return
+
+    _active_label = " · ".join(c.upper() for c in COINS)
     
     print("=" * 115)
     _pm = config.get("data_sources", {}).get("polymarket", {})
     _iv = int(_pm.get("market_interval_sec", 900))
     _ml = "5m" if _iv == 300 else ("15m" if _iv == 900 else f"{_iv}s")
     print(f"  MERIDIAN — Polymarket crypto desk ({_ml} markets)".center(115))
-    print("  BTC · ETH · SOL · XRP  |  Late-window entry  |  Hybrid stop-loss & flip-stop".center(115))
+    print(f"  {_active_label}  |  Late-window entry  |  Hybrid stop-loss & flip-stop".center(115))
     print("  Unified wallet  |  Real-time books  |  FAK execution".center(115))
     print("=" * 115)
     print()
+    print(f"[CONFIG] Active coins: {_active_label} (disabled coins: no feeds / no strategies)")
     
     # Validate system
     if not validate_system():
@@ -302,6 +314,36 @@ def main(args=None):
     print(f"         Entry window (config file): {config['strategy'].get('entry_window_sec', 'default')} seconds (strategy may cap to market length)")
     print(f"         Entry Frequency: Every {config['strategy']['entry_frequency_sec']} seconds")
     print(f"         Price Max: ${config['strategy']['price_max']}")
+    _msm = float(config['strategy'].get('min_spot_move_usd', 0) or 0)
+    _spot_src = spot_price_source_from_config(config)
+    if _msm > 0:
+        print(f"         Min spot move: |current - open| >= ${_msm:,.0f} (USD)")
+    else:
+        print(f"         Min spot move: disabled (min_spot_move_usd=0)")
+    print(
+        f"         Spot source (order logic): {_spot_src.upper()}"
+        + (" — Polymarket RTDS Chainlink" if _spot_src == "chainlink" else " — CoinGecko")
+    )
+    _mwr = float(config['strategy'].get('min_window_range_usd', 0) or 0)
+    if _mwr > 0:
+        _wrs = float(config['strategy'].get('window_range_sample_sec', 5) or 5)
+        _wrm = float(config['strategy'].get('window_range_monitor_sec', 180) or 180)
+        print(
+            f"         Window range filter: Chainlink amplitude >= ${_mwr:,.0f} "
+            f"(sample every {_wrs:.0f}s, monitor {_wrm:.0f}s after open lock)"
+        )
+    else:
+        print(f"         Window range filter: disabled (min_window_range_usd=0)")
+    _cl_open_delay = float(
+        config.get("data_sources", {}).get("polymarket", {}).get(
+            "chainlink_open_fetch_delay_sec", 30
+        )
+        or 30
+    )
+    print(
+        f"         Chainlink open (priceToBeat): fetch after {_cl_open_delay:.0f}s "
+        f"from window start"
+    )
     print(f"         Exit #1: Hybrid Stop-Loss (per coin):")
     
     # Dynamically derive from config
@@ -317,7 +359,27 @@ def main(args=None):
         else:
             print(f"                  {coin.upper()}: Disabled")
     
+    _flip_cfg = config.get("exit", {}).get("flip_stop", {})
     print(f"         Exit #2: Flip-Stop (price reversal protection)")
+    if _flip_cfg.get("reverse_entry_enabled"):
+        _rev_usd = float(_flip_cfg.get("reverse_entry_usd") or 0) or float(
+            config.get("strategy", {}).get("entry_order_usd") or 5
+        )
+        _rev_px = float(_flip_cfg.get("reverse_entry_price") or 0) or float(
+            _flip_cfg.get("price_threshold") or 0.35
+        )
+        _rev_stop = float(_flip_cfg.get("reverse_stop_price_threshold") or 0) or float(
+            _flip_cfg.get("price_threshold") or 0.35
+        )
+        print(
+            f"                  Reverse hedge: when 1st leg ask ≤ ${_rev_px:.2f} "
+            f"→ buy opposite ~${_rev_usd:.0f}"
+        )
+        print(
+            f"                  Reverse flip-stop: hedge leg ask ≤ ${_rev_stop:.2f} → sell & exit"
+        )
+    _first_stop = float(_flip_cfg.get("price_threshold") or 0.35)
+    print(f"                  First-leg flip-stop: token ask ≤ ${_first_stop:.2f} → sell 1st leg")
     _sz = config.get("strategy", {}).get("sizing", {})
     print(
         f"         Sizing: {_sz.get('above_180_sec', 8)}/{_sz.get('above_120_sec', 10)}/{_sz.get('below_120_sec', 12)} "
@@ -399,7 +461,7 @@ def main(args=None):
         if not wallet_balance or wallet_balance <= 0:
             print("\n" + "="*80)
             print("❌ ERROR: Cannot read wallet balance or balance is 0!")
-            print("   Check your PRIVATE_KEY in .env and ensure wallet has USDC")
+            print("   Check PRIVATE_KEY / FUNDER_ADDRESS in .env and deposit USDC (pUSD Cash) on Polymarket")
             print("="*80)
             sys.exit(1)
         
@@ -433,7 +495,7 @@ def main(args=None):
     time.sleep(5)  # Let data stabilize
     
     # Initialize 2 strategies (1 base × 2 coins) using global constants
-    print(f"[SYSTEM] Initializing 2 parallel strategies...")
+    print(f"[SYSTEM] Initializing {len(COINS)} parallel strateg{'y' if len(COINS) == 1 else 'ies'}...")
     strategies = {}
     strategy_names = []
     
@@ -478,7 +540,234 @@ def main(args=None):
     # {coin: {market_slug: price or status}}
     # Values: positive float (valid price), -1 (skipped - started mid-market)
     market_start_prices = {coin: {} for coin in COINS}
-    
+    # slug -> {spot_start, spot_end} for web table after market roll (survives del from market_start_prices)
+    market_window_prices = {coin: {} for coin in COINS}
+    window_range_tracker = WindowRangeTracker.from_config(config)
+
+    _proxy_url = (
+        config.get("data_sources", {}).get("polymarket", {}).get("http_proxy")
+        or config.get("data_sources", {}).get("polymarket", {}).get("https_proxy")
+        or ""
+    ).strip() or None
+    trader_module.set_polymarket_proxy(_proxy_url)
+
+    _pm_ds = config.get("data_sources", {}).get("polymarket", {}) or {}
+    _chainlink_open_fetch_delay_sec = max(
+        0.0, float(_pm_ds.get("chainlink_open_fetch_delay_sec", 30) or 30)
+    )
+
+    def _seconds_since_window_start(slug: str) -> float:
+        try:
+            start = int(str(slug).rsplit("-", 1)[-1])
+            return max(0.0, time.time() - start)
+        except (ValueError, IndexError, TypeError):
+            return 9999.0
+
+    def _chainlink_open_fetch_allowed(slug: str) -> bool:
+        if _chainlink_open_fetch_delay_sec <= 0:
+            return True
+        return _seconds_since_window_start(slug) >= _chainlink_open_fetch_delay_sec
+
+    def _apply_open_price(coin: str, slug: str, open_px: float, source: str) -> bool:
+        """Lock open for spot-move / range filters (Gamma priceToBeat or RTDS fallback)."""
+        if open_px <= 0 or not slug:
+            return False
+        open_px = float(open_px)
+        with market_lock:
+            st = market_start_prices[coin].get(slug, -999)
+            if st in (-1, -2):
+                return False
+            w_prev = dict(market_window_prices[coin].get(slug) or {})
+            prev_src = str(w_prev.get("price_source") or "")
+            if prev_src == "chainlink" and source != "chainlink":
+                return float(w_prev.get("spot_start") or 0) > 0
+            if st == 0 or (isinstance(st, (int, float)) and float(st) > 0) or source == "chainlink":
+                market_start_prices[coin][slug] = open_px
+        w = dict(market_window_prices[coin].get(slug) or {})
+        prev_open = float(w.get("spot_start") or 0)
+        if prev_open <= 0 or source == "chainlink":
+            w["spot_start"] = open_px
+            w["price_source"] = source
+            w["updated_at"] = time.time()
+            market_window_prices[coin][slug] = w
+        if window_range_tracker.enabled:
+            window_range_tracker.on_open_locked(coin, slug, open_px)
+        return True
+
+    def _try_rtds_open_fallback(coin: str, slug: str) -> float:
+        """When Gamma has no priceToBeat yet, use live Chainlink RTDS for open + range sampling."""
+        if not slug or not _chainlink_open_fetch_allowed(slug):
+            return 0.0
+        w_prev = dict(market_window_prices[coin].get(slug) or {})
+        if str(w_prev.get("price_source") or "") == "chainlink" and float(
+            w_prev.get("spot_start") or 0
+        ) > 0:
+            return float(w_prev["spot_start"])
+        if window_range_tracker.enabled and window_range_tracker.has_open_locked(coin, slug):
+            with market_lock:
+                return float(
+                    market_start_prices[coin].get(slug)
+                    or w_prev.get("spot_start")
+                    or 0
+                )
+        fb = float(data_feed.get_chainlink_spot(coin) or 0)
+        if fb <= 0:
+            return 0.0
+        if _apply_open_price(coin, slug, fb, "chainlink_rtds"):
+            print(
+                f"[OPEN-RTDS] {coin.upper()} {slug} | Chainlink RTDS fallback "
+                f"${fb:,.2f} (Gamma priceToBeat not available yet)"
+            )
+            return fb
+        return 0.0
+
+    def _ensure_window_open_locked(coin: str, slug: str) -> None:
+        """Try Gamma lock + RTDS fallback so range/spot filters can run in entry window."""
+        if not slug:
+            return
+        if window_range_tracker.enabled and window_range_tracker.has_open_locked(coin, slug):
+            return
+        w = dict(market_window_prices[coin].get(slug) or {})
+        if float(w.get("spot_start") or 0) > 0:
+            if window_range_tracker.enabled:
+                window_range_tracker.on_open_locked(
+                    coin, slug, float(w["spot_start"])
+                )
+            return
+        if _chainlink_open_fetch_allowed(slug):
+            _lock_chainlink_window(coin, slug, fill_end=False)
+            if window_range_tracker.enabled and window_range_tracker.has_open_locked(coin, slug):
+                return
+            _try_rtds_open_fallback(coin, slug)
+
+    def _lock_chainlink_window(
+        coin: str, slug: str, *, fill_end: bool = False
+    ) -> tuple:
+        """
+        从 Gamma 锁定 Chainlink 标的起(priceToBeat) / 标的止(finalPrice)。
+        禁止用 CoinGecko 现价写入这两列。
+        开盘价：新盘开始后 chainlink_open_fetch_delay_sec 秒才请求 Gamma（避免无效调用）。
+        Gamma 盘中无 priceToBeat 时，用 RTDS Chainlink 现价作 fallback 并启动振幅采样。
+        """
+        if not slug:
+            return 0.0, 0.0
+
+        w_prev = dict(market_window_prices[coin].get(slug) or {})
+        already_have_open = float(w_prev.get("spot_start") or 0) > 0
+        fetch_for_open = _chainlink_open_fetch_allowed(slug) or already_have_open
+        if not fill_end and not fetch_for_open:
+            return 0.0, 0.0
+
+        ptb = 0.0
+        fp = 0.0
+        closed = False
+        try:
+            from polymarket_api import chainlink_window_prices
+
+            cl = chainlink_window_prices(
+                slug, timeout=3, proxy_url=_proxy_url, use_cache=True
+            )
+            ptb = float(cl.get("spot_start") or 0)
+            fp = float(cl.get("spot_end") or 0)
+            closed = bool(cl.get("closed"))
+        except Exception:
+            pass
+
+        w = dict(w_prev)
+        if ptb > 0 and fetch_for_open:
+            _apply_open_price(coin, slug, ptb, "chainlink")
+            w["spot_start"] = ptb
+            w["price_source"] = "chainlink"
+        elif fetch_for_open and not fill_end and float(w.get("spot_start") or 0) <= 0:
+            fb = _try_rtds_open_fallback(coin, slug)
+            if fb > 0:
+                ptb = fb
+                w = dict(market_window_prices[coin].get(slug) or w)
+        if fp > 0 and (fill_end or closed):
+            w["spot_end"] = fp
+            if ptb > 0 or fp > 0:
+                w["price_source"] = w.get("price_source") or "chainlink"
+        w["updated_at"] = time.time()
+        market_window_prices[coin][slug] = w
+        return ptb, fp
+
+    def _chainlink_refresh_worker() -> None:
+        """Background Gamma lookups — never block main loop / UP-DN ask refresh."""
+        while not stop_flag:
+            try:
+                budget = 2
+                for coin in COINS:
+                    if budget <= 0:
+                        break
+                    st = data_feed.get_state(coin)
+                    if not st:
+                        continue
+                    slug = st.get("market_slug") or ""
+                    if not slug:
+                        continue
+                    ste = int(st.get("seconds_till_end") or 0)
+                    _lock_chainlink_window(coin, slug, fill_end=(ste <= 0))
+                    budget -= 1
+                for coin in COINS:
+                    if budget <= 0:
+                        break
+                    for slug, ww in list(market_window_prices[coin].items()):
+                        if budget <= 0:
+                            break
+                        if float((ww or {}).get("spot_end") or 0) > 0:
+                            continue
+                        _lock_chainlink_window(coin, slug, fill_end=True)
+                        budget -= 1
+            except Exception as exc:
+                print(f"[CHAINLINK-REFRESH] {exc}")
+            time.sleep(12)
+
+    threading.Thread(
+        target=_chainlink_refresh_worker,
+        daemon=True,
+        name="chainlink_refresh",
+    ).start()
+
+    if window_range_tracker.enabled:
+
+        def _window_range_sample_loop() -> None:
+            while not stop_flag:
+                try:
+                    for c in COINS:
+                        st = data_feed.get_state(c)
+                        if not st:
+                            continue
+                        slug = st.get("market_slug") or ""
+                        if not slug:
+                            continue
+                        ste = int(st.get("seconds_till_end") or 0)
+                        sn = f"{STRATEGY_BASES[0]}_{c}"
+                        stg = strategies.get(sn)
+                        ew = int(getattr(stg, "entry_window", 120) or 120)
+                        if not window_range_tracker.should_sample(
+                            c,
+                            slug,
+                            seconds_till_end=ste,
+                            entry_window_sec=ew,
+                        ):
+                            continue
+                        px = data_feed.get_chainlink_spot(c)
+                        if px > 0:
+                            window_range_tracker.record_sample(c, slug, px)
+                except Exception as exc:
+                    print(f"[RANGE] sample loop error: {exc}")
+                time.sleep(1.0)
+
+        threading.Thread(
+            target=_window_range_sample_loop,
+            daemon=True,
+            name="window_range_sample",
+        ).start()
+        print(
+            f"[SYSTEM] Window range sampler every {window_range_tracker.sample_interval_sec:.0f}s "
+            f"(Chainlink, before entry window)"
+        )
+
     # Track pending markets for EACH coin separately
     # {coin: {market_slug: {...}}}
     pending_markets = {coin: {} for coin in COINS}
@@ -1286,12 +1575,20 @@ def main(args=None):
             
             # If redeem successful, close positions
             if redeem_success:
-                api_result = get_market_outcome(prev_market)
-                
+                from polymarket_api import get_official_settlement
+
+                api_result = get_official_settlement(
+                    prev_market, timeout=8, proxy_url=_proxy_url
+                )
+
                 if api_result.get("winner"):
                     winner = api_result["winner"]
-                    price_start = pending_info['price_start']
-                    price_final = pending_info['price_final']
+                    price_start = float(api_result.get("price_to_beat") or 0)
+                    price_final = float(api_result.get("final_price") or 0)
+                    if price_start <= 0:
+                        price_start = pending_info.get("price_start") or 0
+                    if price_final <= 0:
+                        price_final = pending_info.get("price_final") or 0
                     
                     # Close for all strategies
                     for base_name in STRATEGY_BASES:
@@ -1348,17 +1645,28 @@ def main(args=None):
                                         total_cost = 0
                                         total_contracts = 0
                                         
+                                        bet_side = "UP"
                                         try:
-                                            with open(f'logs/orders.jsonl', 'r') as f:
+                                            orders_path = Path(
+                                                config.get("logging", {}).get("orders_file", "logs/orders.jsonl")
+                                            )
+                                            if not orders_path.is_file():
+                                                orders_path = Path("logs/orders.jsonl")
+                                            with open(orders_path, "r", encoding="utf-8") as f:
                                                 for line in f:
                                                     try:
                                                         order = json.loads(line)
-                                                        if (order.get('market_slug') == prev_market and 
-                                                            order.get('order_type') == 'BUY' and 
-                                                            order.get('success')):
-                                                            total_cost += order.get('total_spent_usd', 0)
-                                                            total_contracts += order.get('contracts', 0)
-                                                    except:
+                                                        if (
+                                                            order.get("market_slug") == prev_market
+                                                            and order.get("order_type") == "BUY"
+                                                            and order.get("success")
+                                                        ):
+                                                            total_cost += order.get("total_spent_usd", 0)
+                                                            total_contracts += order.get("contracts", 0)
+                                                            ts = order.get("token_side") or order.get("side")
+                                                            if ts in ("UP", "DOWN"):
+                                                                bet_side = ts
+                                                    except Exception:
                                                         continue
                                         except Exception as e:
                                             print(f"[{strategy_name}] Warning: Could not read orders: {e}")
@@ -1367,12 +1675,24 @@ def main(args=None):
                                             # Create minimal trade record
                                             pnl = redeem_amount - total_cost
                                             roi_pct = (pnl / total_cost * 100) if total_cost > 0 else 0
+                                            if bet_side == "UP":
+                                                up_sh, dn_sh = float(total_contracts), 0.0
+                                                up_inv, dn_inv = total_cost, 0.0
+                                            else:
+                                                up_sh, dn_sh = 0.0, float(total_contracts)
+                                                up_inv, dn_inv = 0.0, total_cost
+                                            ps = pending_info.get("price_start", 0) or 0
+                                            pf = pending_info.get("price_final", 0) or 0
                                             
                                             minimal_trade = {
                                                 'market_slug': prev_market,
-                                                'winner': winner,
+                                                'settlement_winner': winner,
                                                 'exit_type': 'natural_close',
-                                                'exit_reason': 'natural_close',
+                                                'exit_reason': 'settlement',
+                                                'btc_start': ps,
+                                                'btc_final': pf,
+                                                'btc_end': pf,
+                                                'bet_side': bet_side,
                                                 'pnl': pnl,
                                                 'roi_pct': roi_pct,
                                                 'total_cost': total_cost,
@@ -1381,15 +1701,16 @@ def main(args=None):
                                                 'total_entries': 0,  # Unknown
                                                 'up_entries': 0,
                                                 'down_entries': 0,
-                                                'up_invested': total_cost,
-                                                'down_invested': 0.0,
-                                                'up_shares': total_contracts,
-                                                'down_shares': 0.0,
+                                                'up_invested': up_inv,
+                                                'down_invested': dn_inv,
+                                                'up_shares': up_sh,
+                                                'down_shares': dn_sh,
                                                 'duration': 0,
                                                 'close_time': time.time(),
                                                 'close_timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
                                                 'reconstructed': True  # Flag to indicate this was reconstructed
                                             }
+                                            enrich_trade_record(minimal_trade, coin)
                                             
                                             # Add to closed_trades for dashboard visibility
                                             trader.closed_trades.append(minimal_trade)
@@ -1462,6 +1783,49 @@ def main(args=None):
             print(f"[REDEEM ERROR] This redeem task will be abandoned!")
             return False
     
+    _web_recent_trades_cache: list = []
+    _web_mode_enabled = bool(getattr(args, "web", False))
+
+    def _refresh_web_recent_trades() -> None:
+        """Merge trades for web — always same source (memory + logs) to avoid flicker."""
+        nonlocal _web_recent_trades_cache
+        if not _web_mode_enabled:
+            return
+        try:
+            from web_dashboard.snapshot_builder import build_recent_trades_trimmed
+
+            recent = build_recent_trades_trimmed(
+                multi_trader=multi_trader,
+                strategy_base=STRATEGY_BASES[0],
+                coins=COINS,
+                data_feed=data_feed,
+                market_windows=market_window_prices,
+                market_starts=market_start_prices,
+                read_trade_files=True,
+            )
+            _web_recent_trades_cache = recent
+            web_dashboard_state_mod.patch_recent_trades(recent)
+        except Exception as e:
+            print(f"[WEB] trade list refresh failed: {e}")
+
+    if _web_mode_enabled:
+        web_dashboard_state_mod.set_bot_context(
+            {
+                "multi_trader": multi_trader,
+                "strategy_base": STRATEGY_BASES[0],
+                "coins": COINS,
+                "data_feed": data_feed,
+                "proxy_url": _proxy_url,
+                "market_windows": market_window_prices,
+                "market_starts": market_start_prices,
+                "lock_chainlink_window": _lock_chainlink_window,
+                "refresh_trades": _refresh_web_recent_trades,
+            }
+        )
+        print(
+            "[WEB] 交易结算改为手动：Dashboard「拉取待结算」或 POST /api/trades/settle-pending"
+        )
+
     # ═══════════════════════════════════════════════════════════════
     # EVENT-DRIVEN CALLBACK - Called INSTANTLY on price changes
     # ═══════════════════════════════════════════════════════════════
@@ -1553,6 +1917,27 @@ def main(args=None):
                         
                         if not our_side or not our_price:
                             continue  # No clear position
+
+                        strategy = strategies.get(strategy_name)
+                        if strategy and not strategy.is_reverse_leg_only(market_slug):
+                            if maybe_reverse_hedge_entry(
+                                config=config,
+                                strategy=strategy,
+                                multi_trader=multi_trader,
+                                strategy_name=strategy_name,
+                                market_slug=market_slug,
+                                coin=coin,
+                                our_side=our_side,
+                                our_price=our_price,
+                                up_ask=up_ask,
+                                down_ask=down_ask,
+                                market_state=market_state,
+                                data_feed=data_feed,
+                                market_window_prices=market_window_prices,
+                                market_start_prices=market_start_prices,
+                                market_lock=market_lock,
+                            ):
+                                return
                         
                         # Get unrealized PnL for stop-loss check
                         unrealized_pnl = position_stats.get('unrealized_pnl', 0)
@@ -1675,94 +2060,82 @@ def main(args=None):
                                 return  # Exit callback after closing
                         
                         # ─────────────────────────────────────────────────
-                        # EXIT CHECK #2: FLIP-STOP (dynamic from strategy)
-                        # Triggers when our side price drops too low
+                        # EXIT CHECK #2: FLIP-STOP (1st leg or flip_reverse hedge leg)
                         # ─────────────────────────────────────────────────
-                        strategy = strategies.get(strategy_name)
-                        if strategy and our_price <= strategy.flip_stop_price:
-                            # Double-check position still exists (race condition protection)
-                            trader = multi_trader.get_trader(strategy_name)
-                            if not trader or market_slug not in trader.positions:
-                                continue  # Position already closed
-                            
-                            # Thread-safe check: market not already closed
-                            with market_lock:
-                                current_status = market_start_prices[coin].get(market_slug, -999)
-                                if current_status == -2:
-                                    continue  # Already closed by another callback
-                            
-                            # 🔥 FIX 1: LOG EXIT TRIGGER (for all 4 coins)
-                            from trade_logger import log_exit_trigger
-                            log_exit_trigger(
-                                market_slug=market_slug,
-                                exit_reason='flip_stop',
-                                coin=coin,
-                                trigger_price=our_price,
-                                threshold_price=strategy.flip_stop_price
+                        if not strategy:
+                            strategy = strategies.get(strategy_name)
+                        strategy.apply_exit_config_from(config)
+                        open_spot = float(market_state.get("market_start_price") or 0)
+                        cur_spot = float(market_state.get("price") or 0)
+                        with market_lock:
+                            _msp = market_start_prices[coin].get(market_slug)
+                            if isinstance(_msp, (int, float)) and float(_msp) > 0:
+                                open_spot = float(_msp) if open_spot <= 0 else open_spot
+                        from strategy import check_flip_stop_trigger
+
+                        trader = multi_trader.get_trader(strategy_name)
+                        fs_target = (
+                            strategy.resolve_flip_stop_target(
+                                market_slug,
+                                up_ask=up_ask,
+                                down_ask=down_ask,
+                                trader=trader,
                             )
-                            
-                            # 🔥 FIX 2: Mark market as closed BEFORE exit to prevent race condition (thread-safe)
-                            with market_lock:
-                                market_start_prices[coin][market_slug] = -2
-                            
-                            # 🔥 FIX 2.1: ATOMIC BLOCK (per-coin protection)
-                            order_executor.block_market(market_slug, coin)
-                            
-                            # Close position (flip-stop with current BID prices for selling)
-                            result = multi_trader.close_market_early_exit(
+                            if strategy
+                            else None
+                        )
+                        _flip_hit = False
+                        if fs_target:
+                            _flip_hit = check_flip_stop_trigger(
+                                our_price=float(fs_target["price"]),
+                                bet_side=str(fs_target["side"]),
+                                flip_stop_price=float(fs_target["threshold"]),
+                                market_open_spot=open_spot,
+                                current_spot=cur_spot,
+                                max_spot_distance_usd=float(
+                                    strategy.flip_stop_max_spot_distance_usd
+                                ),
+                            )
+                        if _flip_hit and fs_target:
+                            if not trader or market_slug not in trader.positions:
+                                continue
+
+                            our_side = str(fs_target["side"])
+                            our_price = float(fs_target["price"])
+                            result = execute_flip_stop_sell_only(
+                                strategy=strategy,
+                                multi_trader=multi_trader,
                                 strategy_name=strategy_name,
                                 market_slug=market_slug,
-                                exit_price=our_price,
-                                exit_reason='flip_stop',
-                                up_bid=up_bid,  # ✅ REAL BID for selling UP tokens
-                                down_bid=down_bid  # ✅ REAL BID for selling DOWN tokens
+                                coin=coin,
+                                our_side=our_side,
+                                our_price=our_price,
+                                up_bid=up_bid,
+                                down_bid=down_bid,
+                                flip_stop_price=float(fs_target["threshold"]),
+                                open_spot=open_spot,
+                                cur_spot=cur_spot,
+                                market_lock=market_lock,
+                                market_start_prices=market_start_prices,
+                                order_executor=order_executor,
                             )
-                            
+
                             if result:
-                                
-                                # Send notifications
-                                if isinstance(result, dict):
-                                    try:
-                                        session_stats = multi_trader.get_session_stats(strategy_name, markets_skipped[coin])
-                                        portfolio_stats = _get_portfolio_stats(multi_trader, markets_skipped, session_start_time)
-                                        notifier.send_market_closed(coin, result, session_stats, portfolio_stats)
-                                        
-                                        # Increment completed markets counter
+                                try:
+                                    if isinstance(result, dict):
+                                        session_stats = multi_trader.get_session_stats(
+                                            strategy_name, markets_skipped[coin]
+                                        )
+                                        portfolio_stats = _get_portfolio_stats(
+                                            multi_trader, markets_skipped, session_start_time
+                                        )
+                                        notifier.send_market_closed(
+                                            coin, result, session_stats, portfolio_stats
+                                        )
                                         total_completed_markets += 1
-                                        
-                                        # Generate and send PnL chart every CHART_INTERVAL markets
-                                        if total_completed_markets - last_chart_at >= CHART_INTERVAL:
-                                            print(f"[CHART] {total_completed_markets} markets completed, generating PnL chart...")
-                                            
-                                            chart_path = f"/root/4coins_live/logs/pnl_chart_{total_completed_markets}.png"
-                                            
-                                            # Import chart generator
-                                            from pnl_chart_generator import generate_pnl_chart
-                                            
-                                            if generate_pnl_chart('/root/4coins_live/logs', COINS, chart_path):
-                                                # Send to Telegram
-                                                caption = f"<b>📊 PnL Chart - {total_completed_markets} Markets Completed</b>"
-                                                if notifier.send_photo(chart_path, caption):
-                                                    print(f"[CHART] ✓ Sent to Telegram successfully")
-                                                    last_chart_at = total_completed_markets
-                                                else:
-                                                    print(f"[CHART] ✗ Failed to send to Telegram")
-                                            else:
-                                                print(f"[CHART] ✗ Failed to generate chart")
-                                    except Exception as e:
-                                        print(f"[ERROR] Notification failed: {e}")
-                                
-                                # Print confirmation
-                                print(f"\n{'='*80}")
-                                print(f"[{coin.upper()}] 🛑 FLIP-STOP @ ${our_price:.2f}")
-                                print(f"[{strategy_name}] {market_slug}")
-                                print(f"[EXIT] Our side: {our_side}")
-                                print(f"[EXIT] Price dropped to: ${our_price:.2f} (≤${strategy.flip_stop_price:.2f})")
-                                if isinstance(result, dict):
-                                    print(f"[EXIT] PnL: ${result['pnl']:+.2f}")
-                                print(f"[EXIT] Market is NO LONGER trading!")
-                                print(f"{'='*80}\n")
-                                return  # Exit callback after closing
+                                except Exception as e:
+                                    print(f"[ERROR] Notification failed: {e}")
+                                return
                     
                     # ═══════════════════════════════════════════════════════
                     # PART 2: ENTRY SIGNAL CHECK (real-time)
@@ -1771,7 +2144,44 @@ def main(args=None):
                     if not strategy:
                         print(f"[ERROR] Strategy {strategy_name} not found in strategies dict!")
                         continue
-                    
+
+                    ste = int(market_state.get("seconds_till_end") or 0)
+                    in_entry_window = (
+                        ste <= strategy.entry_window and ste > 0
+                    )
+                    market_state.update(
+                        window_range_tracker.snapshot_for_state(coin, market_slug)
+                    )
+                    if strategy.min_window_range_usd > 0 and in_entry_window:
+                        _ensure_window_open_locked(coin, market_slug)
+                        range_ok, _ = window_range_tracker.entry_allowed(
+                            coin,
+                            market_slug,
+                            in_entry_window=True,
+                        )
+                        if not range_ok:
+                            continue
+
+                    # Spot move filter: use cached spot only (never HTTP on this hot path).
+                    # Spot refreshed via background thread (CoinGecko) or RTDS push (Chainlink).
+                    if getattr(strategy, "min_spot_move_usd", 0) > 0:
+                        _ensure_window_open_locked(coin, market_slug)
+                        st_spot = data_feed.get_state(coin)
+                        if st_spot:
+                            p = float(st_spot.get("price") or 0)
+                            if p > 0:
+                                market_state["price"] = p
+                        with market_lock:
+                            open_tracked = market_start_prices[coin].get(market_slug, 0)
+                        if isinstance(open_tracked, (int, float)) and open_tracked > 0:
+                            market_state["market_start_price"] = float(open_tracked)
+                        elif not market_state.get("market_start_price"):
+                            ms = float(
+                                data_feed.markets.get(coin, {}).get("market_start_price") or 0
+                            )
+                            if ms > 0:
+                                market_state["market_start_price"] = ms
+
                     # Generate signal with current market state
                     signal = strategy.should_enter(market_state, position_stats)
                     
@@ -1792,6 +2202,8 @@ def main(args=None):
                         
                         # Validate extracted values
                         if not side or contracts is None or contracts <= 0:
+                            if hasattr(strategy, "release_reserved_entry"):
+                                strategy.release_reserved_entry(market_slug)
                             continue
                         
                         # ═══════════════════════════════════════════════════════
@@ -1804,6 +2216,8 @@ def main(args=None):
                             if current_status in [-1, -2]:
                                 # Market closed/skipped during signal processing
                                 print(f"[RACE] {coin.upper()} market {market_slug} status={current_status}, skipping entry")
+                                if hasattr(strategy, "release_reserved_entry"):
+                                    strategy.release_reserved_entry(market_slug)
                                 continue
                         
                         # Check if trading is enabled for this coin
@@ -1811,10 +2225,27 @@ def main(args=None):
                         if not trading_enabled:
                             # Skip entry - trading disabled for this coin
                             dashboard.add_event(f"Trading disabled for {coin.upper()}, skipping entry", 'system')
+                            if hasattr(strategy, "release_reserved_entry"):
+                                strategy.release_reserved_entry(market_slug)
                             continue
                         
                         # Calculate price
                         price = up_ask if side == 'UP' else down_ask
+                        try:
+                            spot_at_entry = float(
+                                data_feed.refresh_coin_spot(coin) or market_state.get("price") or 0
+                            )
+                        except Exception:
+                            spot_at_entry = float(market_state.get("price") or 0)
+                        market_spot_open = 0.0
+                        with market_lock:
+                            win = dict(market_window_prices[coin].get(market_slug) or {})
+                            tracked_open = market_start_prices[coin].get(market_slug, 0)
+                        cl_open = float(win.get("spot_start") or 0)
+                        if cl_open > 0 and win.get("price_source") == "chainlink":
+                            market_spot_open = cl_open
+                        elif isinstance(tracked_open, (int, float)) and tracked_open > 0:
+                            market_spot_open = float(tracked_open)
                         
                         # Execute trade (using correct method name)
                         success = multi_trader.enter_position(
@@ -1825,8 +2256,14 @@ def main(args=None):
                             contracts=contracts,
                             up_ask=up_ask,
                             down_ask=down_ask,
-                            seconds_till_end=market_state.get('seconds_till_end', 0)
+                            seconds_till_end=market_state.get('seconds_till_end', 0),
+                            spot_at_entry=spot_at_entry,
+                            market_spot_open=market_spot_open,
                         )
+                        if not success and hasattr(strategy, "release_reserved_entry"):
+                            strategy.release_reserved_entry(market_slug)
+                        elif success and hasattr(strategy, "confirm_entry_success"):
+                            strategy.confirm_entry_success(market_slug, side=side)
                         
                         if success and contracts > 0:
                             # Update position stats after entry
@@ -1839,6 +2276,12 @@ def main(args=None):
                                 # Print entry confirmation
                                 print(f"[{strategy_name:30s}] {market_slug} | {side:5s} {contracts:3.0f} @ ${price:.2f} | "
                                       f"Total: {total_entries:3d} entries ${total_invested:7.2f} | PnL: ${unrealized_pnl:+7.2f}")
+                            if _web_mode_enabled:
+                                threading.Thread(
+                                    target=_refresh_web_recent_trades,
+                                    daemon=True,
+                                    name="web_trades_after_entry",
+                                ).start()
                 
                 except KeyError as e:
                     print(f"[ERROR] Callback KeyError for {strategy_name}: {e}")
@@ -1858,6 +2301,27 @@ def main(args=None):
     # Register callback with data feed
     data_feed.register_price_callback(on_price_update)
     print("[SYSTEM] ✓ Event-driven trading callbacks registered (INSTANT entry & exit)")
+
+    if _msm > 0:
+        def _spot_refresh_loop():
+            while not stop_flag:
+                for c in COINS:
+                    sn = f"{STRATEGY_BASES[0]}_{c}"
+                    stg = strategies.get(sn)
+                    if not stg or getattr(stg, "min_spot_move_usd", 0) <= 0:
+                        continue
+                    try:
+                        data_feed.refresh_coin_spot(c)
+                    except Exception:
+                        pass
+                # Chainlink RTDS pushes live; poll cache at same interval for coingecko / fallback
+                time.sleep(4.0)
+
+        threading.Thread(
+            target=_spot_refresh_loop, daemon=True, name="spot_refresh"
+        ).start()
+        _src_label = spot_price_source_from_config(config).upper()
+        print(f"[SYSTEM] Spot background refresh every 4s ({_src_label}, min_spot_move_usd, off hot path)")
     print()
     
     print("[SYSTEM] Starting trading loop...")
@@ -1874,7 +2338,29 @@ def main(args=None):
     print()
     
     loop_counter = 0
-    
+    _web_mode = _web_mode_enabled
+
+    if _web_mode:
+        def _web_live_coins_worker() -> None:
+            from web_dashboard.snapshot_builder import build_fast_coin_snapshot
+
+            while not stop_flag:
+                try:
+                    blocks = build_fast_coin_snapshot(
+                        coins=COINS, config=config, data_feed=data_feed
+                    )
+                    web_dashboard_state_mod.patch_live_coins(blocks, time.time())
+                except Exception:
+                    pass
+                time.sleep(0.12)
+
+        threading.Thread(
+            target=_web_live_coins_worker,
+            daemon=True,
+            name="web_live_coins",
+        ).start()
+        print("[WEB] Live UP/DN ask + countdown refresh thread (~8 Hz)")
+
     # Main loop
     while not stop_flag:
         try:
@@ -1886,12 +2372,14 @@ def main(args=None):
             # Process EACH coin independently
             for coin in COINS:
                 market_state = data_feed.get_state(coin)
-                market_slug = market_state['market_slug']
-                price = market_state['price']
+                if not market_state:
+                    continue
+                market_slug = market_state.get('market_slug') or ''
+                price = market_state.get('price') or 0.0
                 
                 if not market_slug:
                     continue
-                
+
                 # STEP 1: Check for market switch FIRST
                 for prev_market in list(market_start_prices[coin].keys()):
                     if prev_market != market_slug and prev_market != "":
@@ -1908,12 +2396,60 @@ def main(args=None):
                             print(f"\n[{coin.upper()}] Market switch: {prev_market} → {market_slug}")
                         
                         price_start = market_start_prices[coin].get(prev_market, 0)
+                        try:
+                            ps = float(price_start) if float(price_start) > 0 else 0.0
+                        except (TypeError, ValueError):
+                            ps = 0.0
+                        ptb_cl, fp_cl = 0.0, 0.0
+                        try:
+                            _pw = dict(market_window_prices[coin].get(prev_market) or {})
+                            ptb_cl = float(_pw.get("spot_start") or 0)
+                            fp_cl = float(_pw.get("spot_end") or 0)
+                        except (TypeError, ValueError):
+                            pass
+
+                        def _bg_lock_prev(_c: str, _slug: str) -> None:
+                            _lock_chainlink_window(_c, _slug, fill_end=True)
+
+                        threading.Thread(
+                            target=_bg_lock_prev,
+                            args=(coin, prev_market),
+                            daemon=True,
+                            name=f"cl_{prev_market[-8:]}",
+                        ).start()
+                        prev_win = market_window_prices[coin].get(prev_market) or {}
+                        if ps <= 0:
+                            ps = ptb_cl or float(prev_win.get("spot_start") or 0)
+                        pe = fp_cl if fp_cl > 0 else float(prev_win.get("spot_end") or 0)
+                        w_update: Dict[str, Any] = {
+                            "updated_at": time.time(),
+                        }
+                        if ptb_cl > 0 or float(prev_win.get("spot_start") or 0) > 0:
+                            w_update["spot_start"] = ptb_cl or float(
+                                prev_win.get("spot_start") or 0
+                            )
+                        if fp_cl > 0:
+                            w_update["spot_end"] = fp_cl
+                        elif float(prev_win.get("spot_end") or 0) > 0:
+                            w_update["spot_end"] = float(prev_win.get("spot_end"))
+                        if ptb_cl > 0 and fp_cl > 0:
+                            w_update["price_source"] = "chainlink"
+                        elif ptb_cl > 0 or fp_cl > 0:
+                            w_update["price_source"] = "pending"
+                        else:
+                            w_update["price_source"] = prev_win.get(
+                                "price_source", "pending"
+                            )
+                        market_window_prices[coin][prev_market] = {
+                            **prev_win,
+                            **w_update,
+                        }
                         
                         # Check if we had a position in this market
                         strategy_name = f"{STRATEGY_BASES[0]}_{coin}"  # Use constant instead of hardcoded
                         trader = multi_trader.get_trader(strategy_name)
                         had_position = trader and prev_market in trader.positions
-                        
+
                         if price_start > 0 or (price_start == 0 and had_position):
                             # 🔥 DISABLED: Old pending_markets logic (replaced by SimpleRedeemCollector)
                             # SimpleRedeemCollector will find and redeem this position automatically via API
@@ -1964,6 +2500,12 @@ def main(args=None):
                         
                         # Remove from tracking
                         del market_start_prices[coin][prev_market]
+                        window_range_tracker.remove_market(coin, prev_market)
+                        for _bn in STRATEGY_BASES:
+                            _sn = f"{_bn}_{coin}"
+                            _st = strategies.get(_sn)
+                            if _st is not None and hasattr(_st, "reset_market"):
+                                _st.reset_market(prev_market)
                 
                 # STEP 2: Track market start price
                 if market_slug not in market_start_prices[coin]:
@@ -1977,16 +2519,56 @@ def main(args=None):
                         # DON'T continue - let it check if in entry window below!
                     else:
                         # We've witnessed a market switch, so this is a NEW valid market
-                        market_start_prices[coin][market_slug] = price if price > 0 else 0.0
+                        spot_open = float(
+                            data_feed.markets.get(coin, {}).get("market_start_price") or 0
+                        ) or price
+                        market_start_prices[coin][market_slug] = spot_open if spot_open > 0 else 0.0
+                        threading.Thread(
+                            target=lambda c=coin, s=market_slug: _lock_chainlink_window(
+                                c, s, fill_end=False
+                            ),
+                            daemon=True,
+                        ).start()
+                        ptb0 = float(
+                            (market_window_prices[coin].get(market_slug) or {}).get(
+                                "spot_start"
+                            )
+                            or 0
+                        )
+                        if ptb0 <= 0 and spot_open > 0:
+                            market_window_prices[coin][market_slug] = {
+                                "spot_start": float(spot_open),
+                                "spot_end": 0.0,
+                                "price_source": "pending",
+                                "updated_at": time.time(),
+                            }
                         print(f"\n[{coin.upper()}] ✓ New market witnessed from start: {market_slug}")
-                        print(f"[TRADE] Start price: ${price:,.2f}" if price > 0 else "[TRADE] Start price: pending...")
+                        print(
+                            f"[TRADE] 标的起 (spot): ${spot_open:,.2f}"
+                            if spot_open > 0
+                            else "[TRADE] Start price: pending..."
+                        )
                         print(f"[TRADE] Will trade this market ✓\n")
                         
                 elif market_start_prices[coin][market_slug] == 0:
-                    # Update pending market with valid price
-                    if price > 0:
-                        market_start_prices[coin][market_slug] = price
-                        print(f"\n[{coin.upper()}] ✓ Start price updated: {market_slug} | Price: ${price:,.2f}\n")
+                    # Update pending market with valid price (RTDS Chainlink while Gamma pending)
+                    spot_open = float(data_feed.get_chainlink_spot(coin) or 0)
+                    if spot_open <= 0:
+                        spot_open = float(
+                            data_feed.markets.get(coin, {}).get("market_start_price") or 0
+                        ) or price
+                    if spot_open > 0 and _chainlink_open_fetch_allowed(market_slug):
+                        _apply_open_price(coin, market_slug, spot_open, "chainlink_rtds")
+                        threading.Thread(
+                            target=lambda c=coin, s=market_slug: _lock_chainlink_window(
+                                c, s, fill_end=False
+                            ),
+                            daemon=True,
+                        ).start()
+                        print(
+                            f"\n[{coin.upper()}] ✓ Start price updated: {market_slug} | "
+                            f"标的起 (RTDS pending Gamma): ${spot_open:,.2f}\n"
+                        )
                         
                 elif market_start_prices[coin][market_slug] == -1:
                     # This market is marked as skip - don't trade it
@@ -2085,28 +2667,61 @@ def main(args=None):
             # 🔥 CHANGED: pending_markets replaced by SimpleRedeemCollector
             # Dashboard now shows empty pending (collector handles redeems automatically)
             all_pending = {}  # Empty - collector handles redeems in background
-            dashboard.render(multi_trader, strategies, data_feed, wallet_balance, all_pending)
-            
+            # Terminal dashboard is heavy — skip when --web (web UI uses snapshot only).
+            if not _web_mode:
+                dashboard.render(multi_trader, strategies, data_feed, wallet_balance, all_pending)
+            elif loop_counter % 30 == 0:
+                dashboard.render(multi_trader, strategies, data_feed, wallet_balance, all_pending)
+
             try:
                 from web_dashboard.snapshot_builder import build_snapshot
+
                 _proj = Path(__file__).resolve().parent.parent
-                _snap = build_snapshot(
-                    coins=COINS,
-                    strategy_base=STRATEGY_BASES[0],
-                    multi_trader=multi_trader,
-                    data_feed=data_feed,
-                    wallet_balance=wallet_balance,
-                    config=config,
-                    session_start_time=session_start_time,
-                    dry_run=safety_guard.dry_run,
-                    markets_skipped=markets_skipped,
-                )
-                web_dashboard_state_mod.set_snapshot(_snap)
-                if getattr(args, "web", False):
-                    web_dashboard_state_mod.write_state_file(_proj, _snap)
-            except Exception:
-                pass
-            
+                if _web_mode:
+                    if loop_counter % 30 == 0:
+                        _snap = build_snapshot(
+                            coins=COINS,
+                            strategy_base=STRATEGY_BASES[0],
+                            multi_trader=multi_trader,
+                            data_feed=data_feed,
+                            wallet_balance=wallet_balance,
+                            config=config,
+                            session_start_time=session_start_time,
+                            dry_run=safety_guard.dry_run,
+                            markets_skipped=markets_skipped,
+                            market_windows=market_window_prices,
+                            market_starts=market_start_prices,
+                            read_trade_files=True,
+                            skip_trade_merge=True,
+                            recent_trades_cached=[],
+                        )
+                        web_dashboard_state_mod.set_snapshot(_snap)
+                        if loop_counter % 60 == 0:
+                            web_dashboard_state_mod.write_state_file(_proj, _snap)
+                else:
+                    _snap = build_snapshot(
+                        coins=COINS,
+                        strategy_base=STRATEGY_BASES[0],
+                        multi_trader=multi_trader,
+                        data_feed=data_feed,
+                        wallet_balance=wallet_balance,
+                        config=config,
+                        session_start_time=session_start_time,
+                        dry_run=safety_guard.dry_run,
+                        markets_skipped=markets_skipped,
+                        market_windows=market_window_prices,
+                        market_starts=market_start_prices,
+                        read_trade_files=True,
+                        skip_trade_merge=False,
+                        recent_trades_cached=None,
+                    )
+                    web_dashboard_state_mod.set_snapshot(_snap)
+            except Exception as _snap_err:
+                print(f"[WEB] snapshot build failed: {_snap_err}")
+                if loop_counter <= 3 or loop_counter % 50 == 0:
+                    import traceback
+                    traceback.print_exc()
+
             # ═══════════════════════════════════════════════════════════
             # 🔥 SYSTEM #2: ASYNC INSTANT STOP-LOSS CHECK (every 0.1 sec)
             # Checks all 4 coins IN PARALLEL
@@ -2115,137 +2730,165 @@ def main(args=None):
                 def check_coin_sys2(coin_name):
                     """Async stop-loss/flip-stop check for one coin"""
                     try:
-                        strategy_name = f"late_entry_v3_{coin_name}"
+                        strategy_name = f"{STRATEGY_BASES[0]}_{coin_name}"
                         if strategy_name not in strategies:
                             return
-                        
+
                         market_state = data_feed.get_state(coin_name)
+                        if not market_state:
+                            return
                         market_slug = market_state.get('market_slug')
                         if not market_slug:
                             return
-                        
-                        # Check market status
+
                         with market_lock:
                             status = market_start_prices.get(coin_name, {}).get(market_slug, -999)
                             if status in [-1, -2, -999]:
                                 return
-                        
-                        # Get prices
+
                         up_ask = market_state.get('up_ask', 0.5)
                         down_ask = market_state.get('down_ask', 0.5)
                         up_bid = market_state.get('up_bid', 0.5)
                         down_bid = market_state.get('down_bid', 0.5)
-                        
-                        # Validate price freshness before exit checks
                         up_ask_ts = market_state.get('up_ask_timestamp', 0)
                         down_ask_ts = market_state.get('down_ask_timestamp', 0)
-                        
-                        is_valid, reason = validate_prices(up_ask, down_ask, up_ask_ts, down_ask_ts, coin_name)
+
+                        is_valid, reason = validate_prices(
+                            up_ask, down_ask, up_ask_ts, down_ask_ts, coin_name
+                        )
                         if not is_valid:
-                            # Skip stop-loss/flip-stop if prices invalid
                             return
-                        
-                        # Get detailed stats
+
                         detailed_stats = multi_trader.traders[strategy_name].get_market_detailed_stats(
                             market_slug=market_slug,
                             up_ask=up_ask,
-                            down_ask=down_ask
+                            down_ask=down_ask,
                         )
-                        
                         if not detailed_stats:
                             return
-                        
-                        # Check stop-loss
+
+                        stg = strategies.get(strategy_name)
+                        if stg and not stg.is_reverse_leg_only(market_slug):
+                            up_shares = detailed_stats.get('up_shares', 0)
+                            down_shares = detailed_stats.get('down_shares', 0)
+                            our_side_r = 'UP' if up_shares > down_shares else 'DOWN'
+                            our_price_r = up_ask if our_side_r == 'UP' else down_ask
+                            if maybe_reverse_hedge_entry(
+                                config=config,
+                                strategy=stg,
+                                multi_trader=multi_trader,
+                                strategy_name=strategy_name,
+                                market_slug=market_slug,
+                                coin=coin_name,
+                                our_side=our_side_r,
+                                our_price=our_price_r,
+                                up_ask=up_ask,
+                                down_ask=down_ask,
+                                market_state=market_state,
+                                data_feed=data_feed,
+                                market_window_prices=market_window_prices,
+                                market_start_prices=market_start_prices,
+                                market_lock=market_lock,
+                            ):
+                                return
+
                         if detailed_stats.get('stop_loss_triggered', False):
                             with market_lock:
                                 if market_start_prices[coin_name].get(market_slug, -999) == -2:
                                     return
-                            
+
                             up_shares = detailed_stats['up_shares']
                             down_shares = detailed_stats['down_shares']
                             our_side = 'UP' if up_shares > down_shares else 'DOWN'
                             our_price = up_ask if our_side == 'UP' else down_ask
-                            
-                            # 🔥 FIX 1: LOG EXIT TRIGGER (for all 4 coins)
+
                             from trade_logger import log_exit_trigger
                             log_exit_trigger(
                                 market_slug=market_slug,
                                 exit_reason='stop_loss',
                                 coin=coin_name,
                                 unrealized_pnl=detailed_stats.get('unrealized_pnl', 0),
-                                threshold_pnl=detailed_stats.get('stop_loss_threshold', 0)
+                                threshold_pnl=detailed_stats.get('stop_loss_threshold', 0),
                             )
-                            
-                            # 🔥 FIX 2: Mark market as closed BEFORE exit to prevent race condition
+
                             with market_lock:
                                 market_start_prices[coin_name][market_slug] = -2
-                            
-                            # 🔥 FIX 2.1: ATOMIC BLOCK (per-coin protection)
+
                             order_executor.block_market(market_slug, coin_name)
-                            
+
                             result = multi_trader.close_market_early_exit(
                                 strategy_name=strategy_name,
                                 market_slug=market_slug,
                                 exit_price=our_price,
                                 exit_reason='stop_loss',
                                 up_bid=up_bid,
-                                down_bid=down_bid
+                                down_bid=down_bid,
                             )
-                            
+
                             if result:
-                                print(f"[SYS#2] 🚨 {coin_name.upper()} STOP-LOSS: PnL=${detailed_stats['unrealized_pnl']:.2f}")
-                        
-                        # Check flip-stop
+                                print(
+                                    f"[SYS#2] 🚨 {coin_name.upper()} STOP-LOSS: "
+                                    f"PnL=${detailed_stats['unrealized_pnl']:.2f}"
+                                )
+
                         if detailed_stats.get('flip_stop_triggered', False):
+                            stg = strategies.get(strategy_name)
+                            if not stg:
+                                return
+
+                            fs_side = detailed_stats.get("flip_stop_side")
+                            if fs_side in ("UP", "DOWN"):
+                                our_side = fs_side
+                                our_price = up_ask if our_side == "UP" else down_ask
+                            else:
+                                up_shares = detailed_stats['up_shares']
+                                down_shares = detailed_stats['down_shares']
+                                our_side = 'UP' if up_shares > down_shares else 'DOWN'
+                                our_price = up_ask if our_side == 'UP' else down_ask
+
+                            open_spot = float(market_state.get("market_start_price") or 0)
+                            cur_spot = float(market_state.get("price") or 0)
                             with market_lock:
-                                if market_start_prices[coin_name].get(market_slug, -999) == -2:
-                                    return
-                            
-                            up_shares = detailed_stats['up_shares']
-                            down_shares = detailed_stats['down_shares']
-                            our_side = 'UP' if up_shares > down_shares else 'DOWN'
-                            our_price = up_ask if our_side == 'UP' else down_ask
-                            
-                            # 🔥 FIX 1: LOG EXIT TRIGGER (for all 4 coins)
-                            from trade_logger import log_exit_trigger
-                            log_exit_trigger(
-                                market_slug=market_slug,
-                                exit_reason='flip_stop',
-                                coin=coin_name,
-                                trigger_price=our_price,
-                                threshold_price=detailed_stats.get('flip_stop_price', 0)
-                            )
-                            
-                            # 🔥 FIX 2: Mark market as closed BEFORE exit to prevent race condition
-                            with market_lock:
-                                market_start_prices[coin_name][market_slug] = -2
-                            
-                            # 🔥 FIX 2.1: ATOMIC BLOCK (per-coin protection)
-                            order_executor.block_market(market_slug, coin_name)
-                            
-                            result = multi_trader.close_market_early_exit(
+                                _msp = market_start_prices[coin_name].get(market_slug)
+                                if isinstance(_msp, (int, float)) and float(_msp) > 0:
+                                    open_spot = float(_msp) if open_spot <= 0 else open_spot
+
+                            stg.apply_exit_config_from(config)
+                            result = execute_flip_stop_sell_only(
+                                strategy=stg,
+                                multi_trader=multi_trader,
                                 strategy_name=strategy_name,
                                 market_slug=market_slug,
-                                exit_price=our_price,
-                                exit_reason='flip_stop',
+                                coin=coin_name,
+                                our_side=our_side,
+                                our_price=our_price,
                                 up_bid=up_bid,
-                                down_bid=down_bid
+                                down_bid=down_bid,
+                                flip_stop_price=float(
+                                    detailed_stats.get("flip_stop_price")
+                                    or stg.flip_stop_price
+                                ),
+                                open_spot=open_spot,
+                                cur_spot=cur_spot,
+                                market_lock=market_lock,
+                                market_start_prices=market_start_prices,
+                                order_executor=order_executor,
                             )
-                            
+
                             if result:
                                 print(f"[SYS#2] 🚨 {coin_name.upper()} FLIP-STOP")
-                    
-                    except Exception as e:
-                        pass  # Silent - don't spam logs
-                
-                # 🔥 Run via executor (in parallel for all coins)
-                try:
-                    sys2_executor.submit(check_coin_sys2, coin)
-                except:
-                    pass
+
+                    except Exception:
+                        pass
+
+                if not _web_mode or loop_counter % 2 == 0:
+                    try:
+                        sys2_executor.submit(check_coin_sys2, coin)
+                    except Exception:
+                        pass
             
             # Sleep - can be slower now (entry/exit in callback)
-            time.sleep(0.1)
+            time.sleep(0.1 if not _web_mode else 0.05)
             
         except Exception as e:
             print(f"[ERROR] Main loop error: {e}")

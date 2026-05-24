@@ -25,7 +25,7 @@ body {
 }
 
 .layout {
-  max-width: 1200px;
+  max-width: 1400px;
   margin: 0 auto;
   padding: 1.25rem 1rem 3rem;
 }
@@ -126,6 +126,14 @@ body {
   font-weight: 400;
   color: var(--muted);
   font-size: 0.85rem;
+}
+
+.panel h2 + .hint {
+  margin: -0.5rem 0 1rem;
+}
+
+tr.row-open td {
+  background: rgba(99, 179, 237, 0.07);
 }
 
 .grid-4 {
@@ -237,8 +245,10 @@ body {
   color: var(--green);
 }
 
-.pnl-neg {
-  color: var(--red);
+.data-table .num {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
 }
 
 #config-editor {
@@ -288,4 +298,44 @@ body {
 .disabled-tag {
   font-size: 0.75rem;
   color: var(--warn);
+}
+
+.trades-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.trades-toolbar .toolbar-label {
+  font-size: 0.85rem;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.trades-toolbar input[type="date"],
+.trades-toolbar input[type="number"],
+.trades-toolbar select {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.25rem 0.4rem;
+  font-size: 0.85rem;
+}
+
+.btn-sm {
+  padding: 0.25rem 0.55rem;
+  font-size: 0.82rem;
+}
+
+#trades-pager-info {
+  min-width: 8rem;
+}
+
+.trades-toolbar .input-narrow {
+  width: 4.5rem;
 }

@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Dict, List
 from datetime import datetime
 
+from trader import Trader
+
 def load_trades(log_dir: str, coins: List[str]) -> Dict[str, List[Dict]]:
     """Load all trades from JSONL files for each coin"""
     all_trades = {}
@@ -268,7 +270,7 @@ def generate_pnl_chart(log_dir: str, coins: List[str], output_path: str) -> bool
             # Get deduplicated trades for this coin
             coin_trades = [t for t in all_trades_timed if t['coin'] == coin]
             if coin_trades:
-                wins = sum(1 for t in coin_trades if t.get('pnl', 0) > 0)
+                wins = sum(1 for t in coin_trades if Trader.infer_trade_outcome_win(t))
                 wr = (wins / len(coin_trades) * 100) if coin_trades else 0
                 final_pnl = coin_cumulative.get(coin, [0])[-1] if coin in coin_cumulative else 0
                 # Use USD instead of $ to avoid matplotlib LaTeX parsing

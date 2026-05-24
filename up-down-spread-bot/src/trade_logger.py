@@ -145,6 +145,33 @@ def log_exit_trigger(market_slug: str, exit_reason: str, coin: str = None,
     
     trades_logger.warning(" | ".join(msg_parts))
 
+
+def log_reverse_entry_trigger(
+    market_slug: str,
+    coin: str = None,
+    first_leg_side: str = None,
+    trigger_price: float = None,
+    threshold_price: float = None,
+    reverse_side: str = None,
+    reverse_ask: float = None,
+):
+    """Log price-triggered reverse hedge entry (not at flip-stop time)."""
+    msg_parts = [f"REVERSE_ENTRY_TRIGGER | Market: {market_slug}"]
+    if coin:
+        msg_parts.append(f"Coin: {coin.upper()}")
+    if first_leg_side:
+        msg_parts.append(f"FirstLeg: {first_leg_side}")
+    if trigger_price is not None:
+        msg_parts.append(f"LegAsk: ${trigger_price:.2f}")
+    if threshold_price is not None:
+        msg_parts.append(f"ReverseEntryPrice: ${threshold_price:.2f}")
+    if reverse_side:
+        msg_parts.append(f"Hedge: {reverse_side}")
+    if reverse_ask is not None:
+        msg_parts.append(f"HedgeAsk: ${reverse_ask:.2f}")
+    trades_logger.warning(" | ".join(msg_parts))
+
+
 def log_market_closing_blocked(market_slug: str, blocked_at: str):
     """
     🔥 NEW: Log race condition protection - blocked buy orders

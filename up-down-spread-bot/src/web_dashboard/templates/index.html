@@ -29,15 +29,43 @@
     </section>
 
     <section class="panel">
-      <h2>Recent closed trades</h2>
+      <h2>交易记录</h2>
+      <p class="hint">含当前持仓（下单后即显示）与已平仓记录；结算数据请点「拉取待结算」手动更新</p>
+      <div class="trades-toolbar">
+        <label class="toolbar-label">拉取条数
+          <input type="number" id="settle-limit" min="1" max="100" value="10" class="input-narrow" title="按下单时间从新到旧，拉取最近 N 条待结算记录；留空=全部" />
+        </label>
+        <button type="button" id="btn-settle-pending" class="btn btn-primary">拉取待结算</button>
+        <span id="settle-status" class="hint"></span>
+        <label class="toolbar-label">下单日起 <input type="date" id="trade-date-from" /></label>
+        <label class="toolbar-label">止 <input type="date" id="trade-date-to" /></label>
+        <button type="button" id="btn-trade-query" class="btn btn-secondary">查询</button>
+        <label class="toolbar-label">每页
+          <select id="trade-page-size">
+            <option value="10">10</option>
+            <option value="20" selected>20</option>
+            <option value="50">50</option>
+          </select>
+        </label>
+        <span id="trades-pager-info" class="hint"></span>
+        <button type="button" id="btn-trade-prev" class="btn btn-secondary btn-sm">上一页</button>
+        <button type="button" id="btn-trade-next" class="btn btn-secondary btn-sm">下一页</button>
+      </div>
       <div class="table-wrap">
         <table class="data-table" id="recent-trades">
           <thead>
             <tr>
               <th>Strategy</th>
-              <th>Market</th>
-              <th>PnL</th>
-              <th>Winner</th>
+              <th>币</th>
+              <th>盘口</th>
+              <th>押注</th>
+              <th>下单时现货</th>
+              <th>下单时间</th>
+              <th>标的起</th>
+              <th>标的止</th>
+              <th>押注结果</th>
+              <th>出场方式</th>
+              <th>盈亏 (USD)</th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -58,7 +86,7 @@
     </section>
 
     <footer class="footer">
-      <p>API: <code>/api/status</code>, <code>/api/config</code>, <code>POST /api/bot/stop</code> · Start bot with <code>python main.py --web</code></p>
+      <p>API: <code>/api/status</code>, <code>/api/trades</code>, <code>POST /api/trades/settle-pending</code> · Start bot with <code>python main.py --web</code></p>
     </footer>
   </div>
   <script src="/static/app.js"></script>

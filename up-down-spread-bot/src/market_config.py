@@ -1,6 +1,20 @@
 """
 Resolve Polymarket market window from config: user-friendly market_window + market_interval_sec.
 """
+from typing import Dict, List
+
+ALL_COINS: List[str] = ["btc", "eth", "sol", "xrp"]
+
+
+def enabled_coins_from_config(cfg: dict) -> List[str]:
+    """Coins with trading.{coin}.enabled == true (only these get feeds / strategies)."""
+    trading: Dict = cfg.get("trading") or {}
+    out: List[str] = []
+    for coin in ALL_COINS:
+        entry = trading.get(coin)
+        if isinstance(entry, dict) and entry.get("enabled"):
+            out.append(coin)
+    return out
 
 
 def apply_market_window_settings(cfg: dict) -> None:
