@@ -15,7 +15,7 @@ import os
 import threading
 import requests
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor
 
 from data_feed import DataFeed
@@ -34,6 +34,7 @@ from spot_price import fetch_coin_spot_usd, fetch_spot_usd, spot_price_source_fr
 from flip_reverse import execute_flip_stop_sell_only
 from reverse_entry import maybe_reverse_hedge_entry
 from window_range_tracker import WindowRangeTracker
+from entry_skip_tracker import EntrySkipTracker
 
 
 # Global configuration constants
@@ -109,15 +110,21 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 
 
-def load_config(config_path: str = None) -> dict:
-    """Load configuration and resolve market_window → market_interval_sec."""
+def load_config(config_path: str = None) -> tuple:
+    """Load configuration and resolve market_window → market_interval_sec.
+
+    Returns (config dict, absolute path to the JSON file).
+    """
     if config_path is None:
         # Default to ../config/config.json relative to this file
         config_path = Path(__file__).parent.parent / "config" / "config.json"
+    else:
+        config_path = Path(config_path)
+    config_path = config_path.resolve()
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
     apply_market_window_settings(cfg)
-    return cfg
+    return cfg, config_path
 
 
 def _parse_cli_args():
@@ -272,7 +279,7 @@ def main(args=None):
     # Track session start time for uptime
     session_start_time = time.time()
     
-    config = load_config()
+    config, config_path = load_config()
     COINS = enabled_coins_from_config(config)
     if not COINS:
         print("[ERROR] No coins enabled — set trading.{coin}.enabled=true in config.json")
@@ -304,6 +311,7 @@ def main(args=None):
     last_chart_at = 0  # Markets count when last chart was sent
     CHART_INTERVAL = config.get('notifications', {}).get('chart_every_n_markets', 10)
     print(f"[CONFIG] Loaded configuration (Meridian · late-window entry + hybrid stop-loss)")
+    print(f"[CONFIG] Config file: {config_path}")
     _pm_cfg = config.get("data_sources", {}).get("polymarket", {})
     _iv_cfg = int(_pm_cfg.get("market_interval_sec", 900))
     _mw_cfg = str(_pm_cfg.get("market_window", "") or ("15m" if _iv_cfg == 900 else "5m" if _iv_cfg == 300 else ""))
@@ -490,7 +498,14 @@ def main(args=None):
     
     # Initialize data feed (shared across all strategies)
     print("[SYSTEM] Initializing multi-market data feed...")
-    data_feed = DataFeed(config)
+    data_feed = DataFeed(config, config_path=config_path)
+    if data_feed.trading_hours.enabled:
+        _th = data_feed.trading_hours
+        _ok, _reason = _th.status_for_dashboard()
+        print(
+            f"[CONFIG] Trading hours (local): {_th.ranges_summary()} | "
+            f"now={'IN' if _ok else 'OUT'} {_reason}"
+        )
     data_feed.start()
     time.sleep(5)  # Let data stabilize
     
@@ -515,7 +530,11 @@ def main(args=None):
     print("\n[SYSTEM] Initializing multi-trader...")
     # Note: capital_per_strategy=0 because all strategies share one wallet balance
     # Individual trader capital is only used for per-coin PnL statistics, not limits
-    multi_trader = MultiTrader(capital_per_strategy=0, strategy_names=strategy_names)
+    multi_trader = MultiTrader(
+        capital_per_strategy=0,
+        strategy_names=strategy_names,
+        config=config,
+    )
     multi_trader_instance = multi_trader  # Store for graceful shutdown
     print()
     
@@ -543,6 +562,8 @@ def main(args=None):
     # slug -> {spot_start, spot_end} for web table after market roll (survives del from market_start_prices)
     market_window_prices = {coin: {} for coin in COINS}
     window_range_tracker = WindowRangeTracker.from_config(config)
+    entry_skip_tracker = EntrySkipTracker()
+    _entry_window_sec_default = int(config.get("strategy", {}).get("entry_window_sec", 120) or 120)
 
     _proxy_url = (
         config.get("data_sources", {}).get("polymarket", {}).get("http_proxy")
@@ -651,6 +672,8 @@ def main(args=None):
         """
         if not slug:
             return 0.0, 0.0
+        if data_feed is not None and not data_feed.trading_hours.operations_active():
+            return 0.0, 0.0
 
         w_prev = dict(market_window_prices[coin].get(slug) or {})
         already_have_open = float(w_prev.get("spot_start") or 0) > 0
@@ -694,6 +717,14 @@ def main(args=None):
     def _chainlink_refresh_worker() -> None:
         """Background Gamma lookups — never block main loop / UP-DN ask refresh."""
         while not stop_flag:
+            if data_feed is not None and not data_feed.trading_hours.operations_active():
+                time.sleep(
+                    min(
+                        60.0,
+                        data_feed.trading_hours.seconds_until_allowed(),
+                    )
+                )
+                continue
             try:
                 budget = 2
                 for coin in COINS:
@@ -732,6 +763,13 @@ def main(args=None):
 
         def _window_range_sample_loop() -> None:
             while not stop_flag:
+                if (
+                    not data_feed.trading_hours.operations_active()
+                ):
+                    data_feed.trading_hours.sleep_until_allowed(
+                        data_feed.stop_event, max_sleep=60.0
+                    )
+                    continue
                 try:
                     for c in COINS:
                         st = data_feed.get_state(c)
@@ -1831,8 +1869,8 @@ def main(args=None):
     # ═══════════════════════════════════════════════════════════════
     def on_price_update(coin: str, market_state: Dict):
         """
-        Called IMMEDIATELY when price changes from Polymarket WebSocket
-        Handles both EXIT checks and ENTRY signals in real-time
+        Called on each successful POST /prices poll (or WS push when market_ws_enabled).
+        Handles both EXIT checks and ENTRY signals.
         Thread-safe with comprehensive error handling
         """
         try:
@@ -1845,6 +1883,33 @@ def main(args=None):
             market_slug = market_state.get('market_slug')
             if not market_slug:
                 return
+
+            ste = int(market_state.get("seconds_till_end") or 0)
+            _in_ew_global = 0 < ste <= _entry_window_sec_default
+
+            def _skip_snap(state: Dict, ste_val: int) -> Dict:
+                up = float(state.get("up_ask") or 0)
+                dn = float(state.get("down_ask") or 0)
+                wr = state.get("window_range_usd")
+                return {
+                    "ste": ste_val,
+                    "conf": f"{abs(up - dn):.2f}",
+                    "up": f"{up:.2f}",
+                    "dn": f"{dn:.2f}",
+                    "range": f"{float(wr):.1f}" if wr is not None else "?",
+                }
+
+            def _skip_all_strategies(reason: str, snap: Optional[Dict] = None) -> None:
+                for base_name in STRATEGY_BASES:
+                    sn = f"{base_name}_{coin}"
+                    entry_skip_tracker.note(
+                        sn, coin, market_slug, reason, snap, in_entry_window=True
+                    )
+
+            if data_feed is not None and not data_feed.trading_hours.operations_active():
+                if _in_ew_global:
+                    _skip_all_strategies("trading_hours", _skip_snap(market_state, ste))
+                return
             
             # Get prices with safe defaults
             up_ask = market_state.get('up_ask', 0.5)
@@ -1854,6 +1919,8 @@ def main(args=None):
             
             # Validate prices
             if up_ask <= 0 or down_ask <= 0 or up_ask > 1 or down_ask > 1:
+                if _in_ew_global:
+                    _skip_all_strategies("invalid_prices", _skip_snap(market_state, ste))
                 return
             
             # ═══════════════════════════════════════════════════════
@@ -1867,6 +1934,15 @@ def main(args=None):
                 
                 status = market_start_prices[coin].get(market_slug, -999)
                 if status in [-1, -2, -999]:
+                    if _in_ew_global:
+                        _status_reason = {
+                            -999: "market_not_tracked",
+                            -1: "market_skipped",
+                            -2: "market_closed",
+                        }.get(status, "market_inactive")
+                        _skip_all_strategies(
+                            _status_reason, _skip_snap(market_state, ste)
+                        )
                     return  # Market inactive, closed, or unknown
             
             # ═══════════════════════════════════════════════════════
@@ -1936,6 +2012,7 @@ def main(args=None):
                                 market_window_prices=market_window_prices,
                                 market_start_prices=market_start_prices,
                                 market_lock=market_lock,
+                                window_range_tracker=window_range_tracker,
                             ):
                                 return
                         
@@ -2154,12 +2231,20 @@ def main(args=None):
                     )
                     if strategy.min_window_range_usd > 0 and in_entry_window:
                         _ensure_window_open_locked(coin, market_slug)
-                        range_ok, _ = window_range_tracker.entry_allowed(
+                        range_ok, range_reason = window_range_tracker.entry_allowed(
                             coin,
                             market_slug,
                             in_entry_window=True,
                         )
                         if not range_ok:
+                            entry_skip_tracker.note(
+                                strategy_name,
+                                coin,
+                                market_slug,
+                                range_reason,
+                                _skip_snap(market_state, ste),
+                                in_entry_window=True,
+                            )
                             continue
 
                     # Spot move filter: use cached spot only (never HTTP on this hot path).
@@ -2182,8 +2267,36 @@ def main(args=None):
                             if ms > 0:
                                 market_state["market_start_price"] = ms
 
+                    snap = _skip_snap(market_state, ste)
+                    if in_entry_window:
+                        block_reason = strategy.entry_block_reason(
+                            market_state, position_stats
+                        )
+                        if block_reason:
+                            entry_skip_tracker.note(
+                                strategy_name,
+                                coin,
+                                market_slug,
+                                block_reason,
+                                snap,
+                                in_entry_window=True,
+                            )
+                            continue
+
                     # Generate signal with current market state
                     signal = strategy.should_enter(market_state, position_stats)
+                    
+                    if not signal:
+                        if in_entry_window:
+                            entry_skip_tracker.note(
+                                strategy_name,
+                                coin,
+                                market_slug,
+                                "entry_reserve_failed",
+                                snap,
+                                in_entry_window=True,
+                            )
+                        continue
                     
                     if signal:
                         # Extract side/contracts - handle LateEntryStrategy format
@@ -2204,6 +2317,15 @@ def main(args=None):
                         if not side or contracts is None or contracts <= 0:
                             if hasattr(strategy, "release_reserved_entry"):
                                 strategy.release_reserved_entry(market_slug)
+                            if in_entry_window:
+                                entry_skip_tracker.note(
+                                    strategy_name,
+                                    coin,
+                                    market_slug,
+                                    "invalid_signal",
+                                    snap,
+                                    in_entry_window=True,
+                                )
                             continue
                         
                         # ═══════════════════════════════════════════════════════
@@ -2218,15 +2340,46 @@ def main(args=None):
                                 print(f"[RACE] {coin.upper()} market {market_slug} status={current_status}, skipping entry")
                                 if hasattr(strategy, "release_reserved_entry"):
                                     strategy.release_reserved_entry(market_slug)
+                                if in_entry_window:
+                                    entry_skip_tracker.note(
+                                        strategy_name,
+                                        coin,
+                                        market_slug,
+                                        "market_closed" if current_status == -2 else "market_skipped",
+                                        snap,
+                                        in_entry_window=True,
+                                    )
                                 continue
                         
                         # Check if trading is enabled for this coin
                         trading_enabled = config.get('trading', {}).get(coin, {}).get('enabled', True)
+                        if data_feed is not None and not data_feed.trading_hours.operations_active():
+                            if hasattr(strategy, "release_reserved_entry"):
+                                strategy.release_reserved_entry(market_slug)
+                            if in_entry_window:
+                                entry_skip_tracker.note(
+                                    strategy_name,
+                                    coin,
+                                    market_slug,
+                                    "trading_hours",
+                                    snap,
+                                    in_entry_window=True,
+                                )
+                            continue
                         if not trading_enabled:
                             # Skip entry - trading disabled for this coin
                             dashboard.add_event(f"Trading disabled for {coin.upper()}, skipping entry", 'system')
                             if hasattr(strategy, "release_reserved_entry"):
                                 strategy.release_reserved_entry(market_slug)
+                            if in_entry_window:
+                                entry_skip_tracker.note(
+                                    strategy_name,
+                                    coin,
+                                    market_slug,
+                                    "trading_disabled",
+                                    snap,
+                                    in_entry_window=True,
+                                )
                             continue
                         
                         # Calculate price
@@ -2247,6 +2400,13 @@ def main(args=None):
                         elif isinstance(tracked_open, (int, float)) and tracked_open > 0:
                             market_spot_open = float(tracked_open)
                         
+                        wr_fields = {}
+                        if window_range_tracker.enabled:
+                            wr_fields = window_range_tracker.fields_for_trade_record(
+                                coin,
+                                market_slug,
+                                spot_now=float(spot_at_entry or market_state.get("price") or 0),
+                            )
                         # Execute trade (using correct method name)
                         success = multi_trader.enter_position(
                             strategy_name=strategy_name,
@@ -2259,11 +2419,23 @@ def main(args=None):
                             seconds_till_end=market_state.get('seconds_till_end', 0),
                             spot_at_entry=spot_at_entry,
                             market_spot_open=market_spot_open,
+                            window_range_high=wr_fields.get("window_range_high"),
+                            window_range_low=wr_fields.get("window_range_low"),
                         )
                         if not success and hasattr(strategy, "release_reserved_entry"):
                             strategy.release_reserved_entry(market_slug)
+                            if in_entry_window:
+                                entry_skip_tracker.note(
+                                    strategy_name,
+                                    coin,
+                                    market_slug,
+                                    "enter_failed",
+                                    snap,
+                                    in_entry_window=True,
+                                )
                         elif success and hasattr(strategy, "confirm_entry_success"):
                             strategy.confirm_entry_success(market_slug, side=side)
+                            entry_skip_tracker.mark_entered(strategy_name, market_slug)
                         
                         if success and contracts > 0:
                             # Update position stats after entry
@@ -2300,11 +2472,18 @@ def main(args=None):
     
     # Register callback with data feed
     data_feed.register_price_callback(on_price_update)
-    print("[SYSTEM] ✓ Event-driven trading callbacks registered (INSTANT entry & exit)")
+    print("[SYSTEM] ✓ Price callbacks registered (poll or WS → entry & exit)")
 
     if _msm > 0:
         def _spot_refresh_loop():
             while not stop_flag:
+                if (
+                    not data_feed.trading_hours.operations_active()
+                ):
+                    data_feed.trading_hours.sleep_until_allowed(
+                        data_feed.stop_event, max_sleep=60.0
+                    )
+                    continue
                 for c in COINS:
                     sn = f"{STRATEGY_BASES[0]}_{c}"
                     stg = strategies.get(sn)
@@ -2342,16 +2521,31 @@ def main(args=None):
 
     if _web_mode:
         def _web_live_coins_worker() -> None:
+            from trading_hours import dashboard_payload, load_from_config_path
             from web_dashboard.snapshot_builder import build_fast_coin_snapshot
 
+            _web_live_err_count = 0
+            _th_last = 0.0
             while not stop_flag:
                 try:
+                    now_m = time.monotonic()
+                    if now_m - _th_last >= 2.0:
+                        th = load_from_config_path(config_path)
+                        web_dashboard_state_mod.patch_trading_hours(
+                            dashboard_payload(th), config_path=config_path
+                        )
+                        _th_last = now_m
                     blocks = build_fast_coin_snapshot(
-                        coins=COINS, config=config, data_feed=data_feed
+                        coins=COINS,
+                        config=config,
+                        data_feed=data_feed,
+                        config_path=config_path,
                     )
                     web_dashboard_state_mod.patch_live_coins(blocks, time.time())
-                except Exception:
-                    pass
+                except Exception as _web_live_err:
+                    _web_live_err_count += 1
+                    if _web_live_err_count <= 3 or _web_live_err_count % 200 == 0:
+                        print(f"[WEB-LIVE] snapshot patch failed: {_web_live_err}")
                 time.sleep(0.12)
 
         threading.Thread(
@@ -2368,9 +2562,13 @@ def main(args=None):
                 stop_flag = True
                 break
             loop_counter += 1
+            data_feed._reload_trading_hours_from_disk()
+            _trading_hours_active = data_feed.trading_hours.operations_active()
             
             # Process EACH coin independently
             for coin in COINS:
+                if not _trading_hours_active:
+                    continue
                 market_state = data_feed.get_state(coin)
                 if not market_state:
                     continue
@@ -2499,6 +2697,11 @@ def main(args=None):
                             #     }
                         
                         # Remove from tracking
+                        entry_skip_tracker.flush_all_for_slug(
+                            coin,
+                            prev_market,
+                            [f"{_bn}_{coin}" for _bn in STRATEGY_BASES],
+                        )
                         del market_start_prices[coin][prev_market]
                         window_range_tracker.remove_market(coin, prev_market)
                         for _bn in STRATEGY_BASES:
@@ -2629,6 +2832,8 @@ def main(args=None):
                             def check_balance_async():
                                 global wallet_balance
                                 try:
+                                    if not data_feed.trading_hours.operations_active():
+                                        return
                                     if not safety_guard.dry_run:
                                         new_balance = order_executor.get_wallet_usdc_balance()
                                         if new_balance and new_balance > 0:
@@ -2686,6 +2891,7 @@ def main(args=None):
                             data_feed=data_feed,
                             wallet_balance=wallet_balance,
                             config=config,
+                            config_path=config_path,
                             session_start_time=session_start_time,
                             dry_run=safety_guard.dry_run,
                             markets_skipped=markets_skipped,
@@ -2706,6 +2912,7 @@ def main(args=None):
                         data_feed=data_feed,
                         wallet_balance=wallet_balance,
                         config=config,
+                        config_path=config_path,
                         session_start_time=session_start_time,
                         dry_run=safety_guard.dry_run,
                         markets_skipped=markets_skipped,
@@ -2730,6 +2937,10 @@ def main(args=None):
                 def check_coin_sys2(coin_name):
                     """Async stop-loss/flip-stop check for one coin"""
                     try:
+                        if (
+                            not data_feed.trading_hours.operations_active()
+                        ):
+                            return
                         strategy_name = f"{STRATEGY_BASES[0]}_{coin_name}"
                         if strategy_name not in strategies:
                             return
@@ -2789,6 +3000,7 @@ def main(args=None):
                                 market_window_prices=market_window_prices,
                                 market_start_prices=market_start_prices,
                                 market_lock=market_lock,
+                                window_range_tracker=window_range_tracker,
                             ):
                                 return
 
@@ -2881,14 +3093,17 @@ def main(args=None):
                     except Exception:
                         pass
 
-                if not _web_mode or loop_counter % 2 == 0:
+                if _trading_hours_active and (not _web_mode or loop_counter % 2 == 0):
                     try:
                         sys2_executor.submit(check_coin_sys2, coin)
                     except Exception:
                         pass
             
             # Sleep - can be slower now (entry/exit in callback)
-            time.sleep(0.1 if not _web_mode else 0.05)
+            if _trading_hours_active:
+                time.sleep(0.1 if not _web_mode else 0.05)
+            else:
+                time.sleep(2.0)
             
         except Exception as e:
             print(f"[ERROR] Main loop error: {e}")

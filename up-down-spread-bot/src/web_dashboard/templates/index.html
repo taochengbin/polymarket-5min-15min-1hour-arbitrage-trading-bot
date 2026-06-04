@@ -23,10 +23,16 @@
       <div class="grid-4" id="summary-stats"></div>
     </section>
 
-    <section class="panel">
-      <h2>Markets (live)</h2>
-      <div class="coins-grid" id="coins-container"></div>
-    </section>
+    <div class="markets-row">
+      <section class="panel panel-markets-live" id="panel-markets">
+        <h2>Markets (live)</h2>
+        <div class="coins-grid" id="coins-container"></div>
+      </section>
+      <section class="panel panel-trading-hours" id="panel-trading-hours">
+        <h2>交易时段</h2>
+        <div id="trading-hours-panel" class="trading-hours-body"></div>
+      </section>
+    </div>
 
     <section class="panel">
       <h2>交易记录</h2>
@@ -59,13 +65,42 @@
               <th>币</th>
               <th>盘口</th>
               <th>押注</th>
+              <th>下单 Ask</th>
+              <th>下单金额</th>
               <th>下单时现货</th>
+              <th>前三分钟高</th>
+              <th>前三分钟低</th>
               <th>下单时间</th>
               <th>标的起</th>
               <th>标的止</th>
               <th>押注结果</th>
               <th>出场方式</th>
               <th>盈亏 (USD)</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-ask-profit">
+      <h2>Ask 盈亏对照</h2>
+      <p class="hint">按买入 ask 计算押中净利润（份数×$1−本金）。数据缓存于 MySQL。</p>
+      <div class="trades-toolbar ask-profit-toolbar">
+        <span class="hint">Ask 范围 0.65 – 1.00 · 步长 0.01</span>
+        <label class="toolbar-label">自定义金额 ($)
+          <input type="number" id="ask-profit-custom-usd" min="0.01" step="0.01" placeholder="如 10" class="input-narrow" />
+        </label>
+        <button type="button" id="btn-ask-profit-query" class="btn btn-secondary">查询</button>
+        <span id="ask-profit-status" class="hint"></span>
+      </div>
+      <div class="table-wrap ask-profit-wrap">
+        <table class="data-table" id="ask-profit-table">
+          <thead>
+            <tr id="ask-profit-head-row">
+              <th>Ask</th>
+              <th>$5 押中利润</th>
+              <th>$25 押中利润</th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -86,7 +121,7 @@
     </section>
 
     <footer class="footer">
-      <p>API: <code>/api/status</code>, <code>/api/trades</code>, <code>POST /api/trades/settle-pending</code> · Start bot with <code>python main.py --web</code></p>
+      <p>API: <code>/api/status</code>, <code>/api/trades</code>, <code>/api/ask-profit</code> · Start bot with <code>python main.py --web</code></p>
     </footer>
   </div>
   <script src="/static/app.js"></script>

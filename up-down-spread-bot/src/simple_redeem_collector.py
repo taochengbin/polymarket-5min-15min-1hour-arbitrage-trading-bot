@@ -88,9 +88,33 @@ class SimpleRedeemCollector:
             self.thread.join(timeout=5)
         print(f"[REDEEM COLLECTOR] Stopped")
     
+    def _wait_trading_hours(self) -> bool:
+        """Block until inside configured trading window. Returns False if collector stopped."""
+        from trading_hours import TradingHours, CallableStopEvent
+
+        hours = TradingHours.from_config(self.config)
+        if hours.operations_active():
+            return self.is_running
+        if not getattr(self, "_hours_pause_logged", False):
+            nxt = hours.next_window_start()
+            when = nxt.strftime("%H:%M") if nxt else "?"
+            print(
+                f"[REDEEM COLLECTOR] ⏸ Outside trading hours — "
+                f"no redeem API until {when}"
+            )
+            self._hours_pause_logged = True
+        stop = CallableStopEvent(lambda: not self.is_running)
+        hours.wait_until_operations_active(stop, max_sleep=60.0)
+        if self.is_running and hours.operations_active():
+            self._hours_pause_logged = False
+        return self.is_running
+
     def _loop(self):
         """Background loop - runs in separate thread"""
         print(f"\n[REDEEM COLLECTOR] Background loop started")
+
+        if not self._wait_trading_hours():
+            return
         
         # 🔥 STARTUP CHECK: right after start (after startup_delay)
         # Goal: collect everything accumulated before script start
@@ -116,6 +140,8 @@ class SimpleRedeemCollector:
         
         # 🔥 REGULAR CHECKS: every check_interval
         while self.is_running:
+            if not self._wait_trading_hours():
+                break
             try:
                 self._check_and_redeem_all(check_type="PERIODIC")
             except Exception as e:

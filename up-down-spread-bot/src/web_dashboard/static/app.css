@@ -178,6 +178,109 @@ tr.row-open td {
   color: var(--warn);
 }
 
+.markets-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 1.25rem;
+  margin-bottom: 1.25rem;
+}
+
+.markets-row .panel-markets-live,
+.markets-row .panel-trading-hours {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 0;
+}
+
+.markets-row .panel-markets-live {
+  flex: 1 1 520px;
+  min-width: 0;
+}
+
+.markets-row .panel-markets-live .coins-grid {
+  flex: 1;
+}
+
+.markets-row .panel-trading-hours {
+  flex: 0 0 13.5rem;
+  width: 13.5rem;
+  text-align: center;
+}
+
+.panel-trading-hours h2,
+.panel-markets-live h2 {
+  margin-bottom: 0.75rem;
+  flex-shrink: 0;
+}
+
+.panel-trading-hours h2 {
+  text-align: center;
+}
+
+.trading-hours-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+  text-align: center;
+  font-size: 1rem;
+  line-height: 1.5;
+}
+
+.trading-hours-head .label-muted {
+  font-weight: 500;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.trading-hours-ranges {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--text);
+  width: 100%;
+}
+
+.trading-hours-ranges .range-line {
+  font-size: 1.12rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+
+.trading-hours-head .label-muted {
+  font-size: 1rem;
+}
+
+.trading-hours-status {
+  margin-top: auto;
+  padding-top: 0.75rem;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--muted);
+  width: 100%;
+}
+
+.trading-hours-status.active {
+  color: var(--green);
+}
+
+.trading-hours-status.paused {
+  color: var(--warn);
+}
+
+.trading-hours-hint {
+  margin-top: 0.5rem;
+  font-size: 0.9rem;
+  color: var(--muted);
+  line-height: 1.35;
+  width: 100%;
+}
+
 .coins-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
@@ -338,4 +441,18 @@ tr.row-open td {
 
 .trades-toolbar .input-narrow {
   width: 4.5rem;
+}
+
+.ask-profit-wrap {
+  max-height: 420px;
+  overflow: auto;
+}
+
+.ask-profit-wrap .data-table th,
+.ask-profit-wrap .data-table td {
+  white-space: nowrap;
+}
+
+#ask-profit-status {
+  min-width: 10rem;
 }

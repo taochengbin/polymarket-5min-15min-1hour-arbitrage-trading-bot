@@ -107,6 +107,12 @@ def settle_one_market(
                 out["success"] = True
                 out["bet_result_label"] = result.get("bet_result_label")
                 out["pnl"] = result.get("pnl")
+                try:
+                    from trade_storage import sync_trader_records_to_db
+
+                    sync_trader_records_to_db(trader, [result])
+                except Exception:
+                    pass
             else:
                 out["error"] = "close_market returned None"
         else:
@@ -118,6 +124,12 @@ def settle_one_market(
                 out["pnl"] = updated.get("pnl")
                 if sp1 <= 0 and not has_chainlink:
                     out["partial"] = True
+                try:
+                    from trade_storage import sync_trader_records_to_db
+
+                    sync_trader_records_to_db(trader, [updated])
+                except Exception:
+                    pass
             else:
                 out["error"] = "no record found"
     except Exception as exc:
@@ -226,25 +238,34 @@ def collect_pending_settlements(
         for trade in list(getattr(tr, "closed_trades", []) or []):
             slug = str(trade.get("market_slug") or "")
             _register_pending(by_key, coin, slug, trade, tr)
-        log_dir = getattr(tr, "log_dir", None)
-        path = Path(log_dir) / "trades.jsonl" if log_dir else None
-        if path and path.is_file():
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            raw = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        slug = str(raw.get("market_slug") or "")
-                        if not slug or not _slug_needs_chainlink_fill(raw):
-                            continue
-                        _register_pending(by_key, coin, slug, raw, tr)
-            except OSError:
-                pass
+        from trade_storage import db_reads_enabled, load_persisted_records
+
+        cfg = getattr(tr, "config", None)
+        if db_reads_enabled(cfg):
+            for raw in load_persisted_records(tr, pending_only=True, limit=0, config=cfg):
+                slug = str(raw.get("market_slug") or "")
+                if not slug or not _slug_needs_chainlink_fill(raw):
+                    continue
+                _register_pending(by_key, coin, slug, raw, tr)
+        elif getattr(tr, "log_dir", None):
+            path = Path(tr.log_dir) / "trades.jsonl"
+            if path.is_file():
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                raw = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            slug = str(raw.get("market_slug") or "")
+                            if not slug or not _slug_needs_chainlink_fill(raw):
+                                continue
+                            _register_pending(by_key, coin, slug, raw, tr)
+                except OSError:
+                    pass
 
     ordered = sorted(by_key.items(), key=lambda kv: kv[1], reverse=True)
     total = len(ordered)

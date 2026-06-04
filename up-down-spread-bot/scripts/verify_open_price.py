@@ -21,7 +21,7 @@ def _current_btc_slug(interval_sec: int = 300) -> str:
 
 
 def main() -> int:
-    config = load_config(str(ROOT / "config" / "config.json"))
+    config, _config_path = load_config(str(ROOT / "config" / "config.json"))
     proxy = (
         config.get("data_sources", {}).get("polymarket", {}).get("http_proxy") or ""
     ).strip() or None

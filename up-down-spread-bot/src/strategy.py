@@ -423,6 +423,92 @@ class LateEntryStrategy:
     def _abort_entry_signal(self, market_slug: str) -> None:
         self.release_reserved_entry(market_slug)
 
+    def entry_block_reason(
+        self, state: Dict, position: Optional[Dict] = None
+    ) -> Optional[str]:
+        """
+        Read-only entry gate (no try_reserve_entry). Returns reason if blocked, else None.
+        """
+        market = state.get("market_slug") or ""
+        if not market:
+            return "no_market_slug"
+        time_left = int(state.get("seconds_till_end") or 0)
+        up_ask = float(state.get("up_ask") or 0)
+        down_ask = float(state.get("down_ask") or 0)
+
+        if self._flip_stop_handled.get(market):
+            return "flip_stop_handled"
+        if self._flip_reverse_done.get(market):
+            return "flip_reverse_done"
+        if self._entries_placed.get(market, 0) >= self.max_entries_per_market:
+            return "already_entered"
+        with self._state_lock:
+            if self._entry_signal_pending.get(market):
+                return "entry_pending"
+
+        if time_left > self.entry_window or time_left <= 0:
+            return "outside_entry_window"
+
+        if self.min_window_range_usd > 0:
+            wr = state.get("window_range_usd")
+            if wr is None:
+                return "window_range_unknown"
+            try:
+                wr_f = float(wr)
+                if wr_f < self.min_window_range_usd:
+                    return f"window_range_low({wr_f:.1f}<{self.min_window_range_usd:.0f})"
+            except (TypeError, ValueError):
+                return "window_range_unknown"
+
+        now = time.time()
+        if market in self.last_entry and now - self.last_entry[market] < self.entry_freq:
+            return "entry_cooldown"
+
+        if self.min_spot_move_usd > 0:
+            open_px = float(
+                state.get("market_start_price") or state.get("spot_start") or 0
+            )
+            cur_px = float(
+                state.get("price") or state.get("current_price") or state.get("spot") or 0
+            )
+            if open_px <= 0 or cur_px <= 0:
+                return "spot_open_or_cur_missing"
+            spot_move_abs = abs(cur_px - open_px)
+            if spot_move_abs < self.min_spot_move_usd:
+                return (
+                    f"spot_move_low({spot_move_abs:.1f}<{self.min_spot_move_usd:.0f})"
+                )
+
+        spread = up_ask + down_ask
+        if spread <= 0:
+            return "spread_invalid"
+        if spread > self.max_spread:
+            return f"spread_high({spread:.3f}>{self.max_spread})"
+
+        confidence = abs(up_ask - down_ask)
+        if confidence < self.min_confidence:
+            return f"confidence_low({confidence:.2f}<{self.min_confidence:.2f})"
+
+        favorite = "UP" if up_ask > down_ask else "DOWN"
+        fav_price = up_ask if favorite == "UP" else down_ask
+
+        if fav_price > self.price_max:
+            return f"price_max({fav_price:.2f}>{self.price_max})"
+        if not side_entry_price_allowed(
+            favorite,
+            fav_price,
+            global_price_max=float(self.price_max),
+            side_filters=self.side_price_filters,
+        ):
+            return "side_price_filter"
+
+        if position:
+            total_cost = position.get("total_cost", 0)
+            if total_cost >= self.max_investment:
+                return "max_investment"
+
+        return None
+
     def should_enter(self, state: Dict, position: Optional[Dict] = None) -> Optional[Dict]:
         """
         Check if should enter (Late Entry V3 logic)

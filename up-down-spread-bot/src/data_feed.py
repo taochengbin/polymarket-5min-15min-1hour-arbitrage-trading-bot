@@ -24,6 +24,7 @@ from proxy_env import (
 from spot_price import fetch_coin_spot_usd, fetch_spot_usd, spot_price_source_from_config
 from chainlink_rtds import ChainlinkRtdsFeed, RTDS_WS_URL
 from market_config import enabled_coins_from_config
+from trading_hours import TradingHours
 
 _MIN_TOKEN_PX = 0.001
 _MAX_TOKEN_PX = 1.0
@@ -32,9 +33,18 @@ _MAX_TOKEN_PX = 1.0
 class DataFeed:
     """Polymarket orderbooks for BTC, ETH, SOL, XRP (configurable 5m or 15m windows)."""
     
-    def __init__(self, config: Dict):
+    def __init__(self, config: Dict, config_path=None):
         self.config = config
-        
+        self._config_path = None
+        if config_path is not None:
+            from pathlib import Path
+
+            self._config_path = Path(config_path).resolve()
+
+        from market_config import apply_market_window_settings
+
+        apply_market_window_settings(self.config)
+
         # ✅ POSITION TRACKER - single source of truth for positions!
         self.position_tracker = PositionTracker()
         
@@ -66,8 +76,29 @@ class DataFeed:
         # Polymarket WS: optional best_bid_ask / new_market stream. Default off — some proxies or
         # server paths misbehave with custom_feature_enabled; book + price_change work without it.
         self._ws_custom_features: bool = bool(pm.get("websocket_custom_features", False))
+        self._market_ws_enabled: bool = bool(pm.get("market_ws_enabled", True))
         self._clob_host = os.getenv("CLOB_HOST", "https://clob.polymarket.com").rstrip("/")
-        self._clob_poll_sec = float(pm.get("clob_poll_interval_sec", 0.35))
+        try:
+            self._clob_poll_sec = float(pm.get("clob_poll_interval_sec", 0.35))
+        except (TypeError, ValueError):
+            self._clob_poll_sec = 0.35
+        if self._clob_poll_sec < 0:
+            self._clob_poll_sec = 0.0
+        if not self._market_ws_enabled and self._clob_poll_sec <= 0:
+            print(
+                "[DATA] ⚠ market_ws_enabled=false requires clob_poll_interval_sec > 0"
+            )
+        _soft_raw = pm.get("watchdog_soft_rest_sec")
+        if _soft_raw is None and self._clob_poll_sec <= 0:
+            self._watchdog_soft_rest_sec = 5.0
+        else:
+            try:
+                self._watchdog_soft_rest_sec = max(0.0, float(_soft_raw or 0))
+            except (TypeError, ValueError):
+                self._watchdog_soft_rest_sec = 0.0
+        self._watchdog_soft_rest_mono: Dict[str, float] = {
+            c: 0.0 for c in self.enabled_coins
+        }
 
         self.market_interval_sec = int(pm.get("market_interval_sec", 900))
         if self.market_interval_sec <= 0:
@@ -126,6 +157,66 @@ class DataFeed:
         # Event-driven callbacks for price updates
         self.price_callbacks = []
 
+        # PM market WS watchdog (A: slug/window drift, B: stale ask) — no REST poll
+        pm_cfg = config.get("data_sources", {}).get("polymarket", {}) or {}
+        self._ws_watchdog_interval_sec = max(
+            0.5, float(pm_cfg.get("ws_watchdog_interval_sec", 1.0) or 1.0)
+        )
+        self._ws_stale_ask_sec = max(
+            5.0, float(pm_cfg.get("ws_stale_ask_sec", 15.0) or 15.0)
+        )
+        self._ws_window_ended_grace_sec = max(
+            2.0, float(pm_cfg.get("ws_window_ended_grace_sec", 5.0) or 5.0)
+        )
+        self._ws_force_close_cooldown_sec = max(
+            3.0, float(pm_cfg.get("ws_force_close_cooldown_sec", 8.0) or 8.0)
+        )
+        self._pm_ws_lock = {c: threading.Lock() for c in self.enabled_coins}
+        self._pm_ws_app: Dict[str, Any] = {c: None for c in self.enabled_coins}
+        self._pm_force_close_mono: Dict[str, float] = {c: 0.0 for c in self.enabled_coins}
+        self._pm_hours_resume_mono: Dict[str, float] = {c: 0.0 for c in self.enabled_coins}
+        self._clob_rest_fail_streak = 0
+        self._last_clob_rest_ok_mono = time.monotonic()
+        self._watchdog_stale_streak: Dict[str, int] = {
+            c: 0 for c in self.enabled_coins
+        }
+        self._watchdog_callback_mono: Dict[str, float] = {
+            c: 0.0 for c in self.enabled_coins
+        }
+        self._last_book_ok_mono: Dict[str, float] = {
+            c: 0.0 for c in self.enabled_coins
+        }
+        self._last_pm_ws_msg_mono: Dict[str, float] = {
+            c: 0.0 for c in self.enabled_coins
+        }
+        self._ui_rest_mono: Dict[str, float] = {c: 0.0 for c in self.enabled_coins}
+        self._ui_rest_interval_sec = max(
+            6.0, float(pm_cfg.get("ui_book_rest_interval_sec", 8.0) or 8.0)
+        )
+        self._resync_throttle_mono: Dict[str, float] = {
+            c: 0.0 for c in self.enabled_coins
+        }
+        self._resync_throttle_sec = max(
+            3.0, float(pm_cfg.get("market_resync_throttle_sec", 5.0) or 5.0)
+        )
+        self._ask_frozen_sec = max(
+            6.0, float(pm_cfg.get("ask_price_frozen_sec", 8.0) or 8.0)
+        )
+        self._last_ask_pair: Dict[str, Tuple[float, float]] = {}
+        self._last_ask_change_mono: Dict[str, float] = {
+            c: time.monotonic() for c in self.enabled_coins
+        }
+        # Lock-free UI read cache — published on each book write (HTTP / 8Hz patch).
+        self._ui_state_cache: Dict[str, Dict[str, Any]] = {}
+        self._ui_state_cache_lock = threading.Lock()
+        # UI/trading read path: markets only (clob_poll + WS write here).
+        self._ws_post_hours_grace_sec = max(
+            10.0, float(pm_cfg.get("ws_post_hours_grace_sec", 45.0) or 45.0)
+        )
+        self.trading_hours = TradingHours.from_config(config)
+        self._hours_outside_logged: set = set()
+        self._hours_feeds_paused_logged = False
+
         eff = resolve_proxy_url(self._proxy_url_override)
         if self._chainlink_feed is not None:
             self._chainlink_feed._proxy_url_override = self._proxy_url_override
@@ -149,6 +240,12 @@ class DataFeed:
         print(
             f"[DATA] Active market feeds: {', '.join(c.upper() for c in self.enabled_coins)}"
         )
+        if self.trading_hours.enabled:
+            print(
+                f"[DATA] Trading hours active (local): {self.trading_hours.ranges_summary()} "
+                f"— no Polymarket/Gamma outside windows; "
+                f"watchdog resumes after {self._ws_post_hours_grace_sec:.0f}s grace"
+            )
     
     def _on_chainlink_spot_update(self, coin: str, value: float) -> None:
         """RTDS push → update in-memory spot used by strategy / flip-stop."""
@@ -175,18 +272,97 @@ class DataFeed:
         px = self._chainlink_feed.get_price(coin)
         return float(px) if px and px > 0 else 0.0
 
+    def _pause_external_feeds_for_hours(self) -> None:
+        """Stop RTDS (and ensure PM WS closed) while outside trading windows."""
+        if self._chainlink_feed is not None:
+            self._chainlink_feed.stop()
+        for coin in self.enabled_coins:
+            with self._pm_ws_lock[coin]:
+                ws = self._pm_ws_app.get(coin)
+            if ws is not None:
+                self._close_pm_ws(coin, "outside trading window", source="hours")
+
+    def _resume_external_feeds_for_hours(self) -> None:
+        if self._chainlink_feed is not None:
+            self._chainlink_feed.start()
+
+    def _reload_trading_hours_from_disk(self) -> None:
+        if self._config_path is None or not self._config_path.exists():
+            return
+        try:
+            from trading_hours import load_from_config_path
+
+            new_th = load_from_config_path(self._config_path)
+        except Exception:
+            return
+        old = self.trading_hours.ranges_summary()
+        new = new_th.ranges_summary()
+        self.trading_hours = new_th
+        if old != new:
+            print(f"[HOURS] trading_hours reloaded from disk: {new}")
+
+    def _trading_hours_supervisor(self) -> None:
+        """Start/stop Chainlink RTDS with trading windows (PM workers self-pause)."""
+        while not self.stop_event.is_set():
+            self._reload_trading_hours_from_disk()
+            if not self.trading_hours.enabled:
+                time.sleep(30.0)
+                continue
+            if self.trading_hours.operations_active():
+                if self._hours_feeds_paused_logged:
+                    nxt = self.trading_hours.active_range_label() or "window"
+                    print(
+                        f"[HOURS] ▶ Trading window open ({nxt}) — "
+                        f"resuming RTDS + PM feeds"
+                    )
+                    self._hours_feeds_paused_logged = False
+                self._resume_external_feeds_for_hours()
+                time.sleep(5.0)
+            else:
+                if not self._hours_feeds_paused_logged:
+                    when = self.trading_hours.next_window_start()
+                    when_s = when.strftime("%H:%M") if when else "?"
+                    print(
+                        f"[HOURS] ⏸ Outside trading window "
+                        f"({self.trading_hours.ranges_summary()}) — "
+                        f"all external feeds paused until {when_s}"
+                    )
+                    self._hours_feeds_paused_logged = True
+                self._pause_external_feeds_for_hours()
+                self.trading_hours.sleep_until_allowed(self.stop_event, max_sleep=60.0)
+
     def start(self):
         """Start data streams for enabled coins only."""
         if self._chainlink_feed is not None:
-            self._chainlink_feed.start()
-            print("[DATA] Started Chainlink RTDS spot feed")
+            if self.trading_hours.operations_active():
+                self._chainlink_feed.start()
+                print("[DATA] Started Chainlink RTDS spot feed")
+            else:
+                print("[DATA] Chainlink RTDS deferred until trading window opens")
 
-        for coin in self.enabled_coins:
-            pm_thread = threading.Thread(target=self._polymarket_worker, args=(coin,), daemon=True)
-            pm_thread.start()
-            self.threads.append(pm_thread)
-            print(f"[DATA] Started Polymarket feed for {coin.upper()}")
-        
+        if self.trading_hours.enabled:
+            sup = threading.Thread(
+                target=self._trading_hours_supervisor,
+                daemon=True,
+                name="trading_hours_supervisor",
+            )
+            sup.start()
+            self.threads.append(sup)
+
+        if self._market_ws_enabled:
+            for coin in self.enabled_coins:
+                pm_thread = threading.Thread(
+                    target=self._polymarket_worker, args=(coin,), daemon=True
+                )
+                pm_thread.start()
+                self.threads.append(pm_thread)
+                print(f"[DATA] Started Polymarket WS feed for {coin.upper()}")
+        else:
+            print(
+                "[DATA] PM market WebSocket OFF — POST /prices poll drives "
+                "entry + exit checks"
+            )
+
         # ❌ USER CHANNEL DISABLED - WebSocket auth doesn't work
         # Using REST API takingAmount/makingAmount instead!
         print(f"[DATA] ℹ️  Position tracking via REST API responses")
@@ -196,15 +372,45 @@ class DataFeed:
         timer_thread.start()
         self.threads.append(timer_thread)
 
-        # REST top-of-book poll — keeps UP/DN ask fresh when WS is quiet or proxy drops events
-        poll_thread = threading.Thread(target=self._clob_poll_worker, daemon=True, name="clob_poll")
-        poll_thread.start()
-        self.threads.append(poll_thread)
-        
+        watchdog_thread = threading.Thread(
+            target=self._pm_ws_watchdog_worker,
+            daemon=True,
+            name="pm_ws_watchdog",
+        )
+        watchdog_thread.start()
+        self.threads.append(watchdog_thread)
+        if self._market_ws_enabled:
+            if self._clob_poll_sec > 0:
+                print(
+                    f"[DATA] PM WebSocket watchdog every {self._ws_watchdog_interval_sec:g}s "
+                    f"(stale ask>{self._ws_stale_ask_sec:g}s → WS reconnect + on-demand REST)"
+                )
+            else:
+                print(
+                    f"[DATA] CLOB REST poll OFF — ask via WS; watchdog every "
+                    f"{self._ws_watchdog_interval_sec:g}s "
+                    f"(soft REST @ {self._watchdog_soft_rest_sec:g}s stale, "
+                    f"hard reconnect @ {self._ws_stale_ask_sec:g}s)"
+                )
+
+        if self._clob_poll_sec > 0:
+            poll_thread = threading.Thread(
+                target=self._clob_poll_worker, daemon=True, name="clob_poll"
+            )
+            poll_thread.start()
+            self.threads.append(poll_thread)
+            eff_poll = max(0.25, self._clob_poll_sec)
+            print(
+                f"[DATA] CLOB POST /prices poll every {eff_poll:g}s "
+                f"(clob_poll_interval_sec={self._clob_poll_sec:g}; 0=disabled)"
+            )
+
         print(
             f"[DATA] All feeds started: {len(self.enabled_coins)} Polymarket orderbook(s) "
             f"({self.market_slug_suffix} / {self.market_interval_sec}s windows)"
         )
+        for coin in self.enabled_coins:
+            self._publish_ui_state(coin)
     
     def stop(self):
         """Stop all data streams"""
@@ -220,43 +426,266 @@ class DataFeed:
         
         print("[DATA] Feeds stopped")
     
+    def _poll_drives_entry(self) -> bool:
+        """Poll-only mode: no PM market WS; CLOB /prices triggers strategy callbacks."""
+        return not self._market_ws_enabled and self._clob_poll_sec > 0
+
+    def _register_market_tokens(
+        self, coin: str, market_slug: str, tokens: Dict[str, Any]
+    ) -> None:
+        """Register CLOB token IDs for order execution (required on each new window)."""
+        self.position_tracker.register_market(
+            market_slug=market_slug,
+            up_token_id=tokens["up"],
+            down_token_id=tokens["down"],
+        )
+        trader_module.set_token_ids(
+            market_slug=market_slug,
+            up_token_id=tokens["up"],
+            down_token_id=tokens["down"],
+            condition_id=tokens.get("condition_id", ""),
+            neg_risk=tokens.get("neg_risk", True),
+        )
+
+    def _sync_market_for_current_slug(self, coin: str, *, quiet: bool = False) -> bool:
+        """Align slug + CLOB token IDs with current window."""
+        expected = self._current_slug(coin)
+        with self.locks[coin]:
+            stored_slug = (self.markets[coin].get("slug") or "").strip()
+            raw = self.markets[coin].get("tokens") or {}
+            have_tokens = bool(
+                self._norm_token_id(raw.get("up"))
+                and self._norm_token_id(raw.get("down"))
+            )
+        if stored_slug == expected and have_tokens:
+            return True
+        new_tokens = self._fetch_tokens(coin)
+        if not new_tokens:
+            return False
+        now = int(time.time())
+        iv = self.market_interval_sec
+        market_end = ((now // iv) * iv) + iv
+        with self.locks[coin]:
+            if stored_slug != expected:
+                self.markets[coin]["market_start_price"] = 0.0
+                self.markets[coin]["up_ask_timestamp"] = 0.0
+                self.markets[coin]["down_ask_timestamp"] = 0.0
+            self.markets[coin]["slug"] = expected
+            self.markets[coin]["tokens"] = new_tokens
+            self.markets[coin]["market_end_time"] = market_end
+            self.markets[coin]["seconds_till_end"] = max(0, market_end - now)
+            if (
+                self.spot_price_source != "chainlink"
+                and self.markets[coin]["market_start_price"] == 0.0
+            ):
+                if coin == "btc":
+                    self.markets[coin]["market_start_price"] = self.btc_price
+                elif coin == "eth":
+                    self.markets[coin]["market_start_price"] = self.eth_price
+            self._mark_book_fresh(coin)
+        self._register_market_tokens(coin, expected, new_tokens)
+        if not quiet:
+            print(
+                f"[PM-{coin.upper()}] Token sync → {expected[-24:]} "
+                f"(was {stored_slug[-24:] if stored_slug else 'empty'})"
+            )
+        return True
+
+    def book_age_sec(self, coin: str) -> float:
+        """Seconds since last UP/DN ask timestamp in markets (for dashboard stale badge)."""
+        if hasattr(self, "peek_book_age_sec"):
+            age = float(self.peek_book_age_sec(coin))
+            if age < 9000.0:
+                return age
+        if coin not in self.markets:
+            return 9999.0
+        if not self.locks[coin].acquire(timeout=0.15):
+            return 9999.0
+        try:
+            up_ts = float(self.markets[coin].get("up_ask_timestamp") or 0)
+            down_ts = float(self.markets[coin].get("down_ask_timestamp") or 0)
+        finally:
+            self.locks[coin].release()
+        ts = max(up_ts, down_ts)
+        return max(0.0, time.time() - ts) if ts > 0 else 9999.0
+
+    def _fresh_ste_for_coin(self, coin: str) -> int:
+        """Wall-clock countdown — safe without markets lock."""
+        now = int(time.time())
+        slug = self._current_slug(coin)
+        try:
+            slot = int(slug.rsplit("-", 1)[-1])
+            return max(0, slot + self.market_interval_sec - now)
+        except (ValueError, TypeError):
+            pass
+        if coin in self.markets:
+            market_end = int(self.markets[coin].get("market_end_time") or 0)
+            if market_end > 0:
+                return max(0, market_end - now)
+        return 0
+
+    def _publish_ui_state_unlocked(self, coin: str) -> None:
+        """Copy markets → lock-free UI cache. Caller must hold locks[coin]."""
+        st = self._get_state_unlocked(coin)
+        if not st:
+            return
+        snap = dict(st)
+        snap["market_slug"] = self._current_slug(coin)
+        snap["seconds_till_end"] = self._fresh_ste_for_coin(coin)
+        with self._ui_state_cache_lock:
+            self._ui_state_cache[coin] = snap
+
+    def _publish_ui_state(self, coin: str) -> None:
+        """Best-effort publish when caller does not already hold the coin lock."""
+        if coin not in self.markets:
+            return
+        if not self.locks[coin].acquire(timeout=0.5):
+            return
+        try:
+            self._publish_ui_state_unlocked(coin)
+        finally:
+            self.locks[coin].release()
+
+    def peek_ui_state(self, coin: str) -> Optional[Dict]:
+        """Non-blocking dashboard read — ste refreshed from wall clock each call."""
+        with self._ui_state_cache_lock:
+            cached = self._ui_state_cache.get(coin)
+            if not cached:
+                return None
+            out = dict(cached)
+        out["market_slug"] = self._current_slug(coin)
+        out["seconds_till_end"] = self._fresh_ste_for_coin(coin)
+        ua = float(out.get("up_ask") or 0)
+        da = float(out.get("down_ask") or 0)
+        if ua > 0 and da > 0:
+            out["confidence"] = abs(da - ua)
+        return out
+
+    def peek_book_age_sec(self, coin: str) -> float:
+        """Age since last successful book write (_last_book_ok_mono, no markets lock)."""
+        last = float(self._last_book_ok_mono.get(coin) or 0.0)
+        if last > 0:
+            return max(0.0, time.monotonic() - last)
+        with self._ui_state_cache_lock:
+            st = self._ui_state_cache.get(coin) or {}
+            up_ts = float(st.get("up_ask_timestamp") or 0)
+            down_ts = float(st.get("down_ask_timestamp") or 0)
+        ts = max(up_ts, down_ts)
+        return max(0.0, time.time() - ts) if ts > 0 else 9999.0
+
+    def _ws_socket_open(self, coin: str) -> Tuple[bool, bool]:
+        """Return (ws_app_present, sock_connected)."""
+        with self._pm_ws_lock[coin]:
+            ws = self._pm_ws_app.get(coin)
+        if ws is None:
+            return False, False
+        sock = getattr(ws, "sock", None)
+        if sock is None:
+            return True, False
+        try:
+            return True, bool(getattr(sock, "connected", True))
+        except Exception:
+            return True, True
+
+    def feed_connectivity_status(self, coins: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Per-coin WS + book freshness for /api/health (read-only)."""
+        coins = coins or list(self.enabled_coins)
+        now_m = time.monotonic()
+        out: Dict[str, Any] = {}
+        for coin in coins:
+            if coin not in self.enabled_coins:
+                continue
+            present, sock_ok = self._ws_socket_open(coin)
+            last_ws = float(self._last_pm_ws_msg_mono.get(coin) or 0.0)
+            ws_msg_age = round(now_m - last_ws, 2) if last_ws > 0 else None
+            book_age = round(self.peek_book_age_sec(coin), 2)
+            st = self.peek_ui_state(coin) or {}
+            if self._market_ws_enabled:
+                ws_alive = bool(
+                    present
+                    and sock_ok
+                    and ws_msg_age is not None
+                    and ws_msg_age < 30.0
+                )
+            else:
+                ws_alive = False
+                present = False
+                sock_ok = False
+            poll_ok = book_age < max(3.0, self._clob_poll_sec * 3)
+            out[coin] = {
+                "ws_app_present": present,
+                "ws_sock_connected": sock_ok,
+                "ws_last_msg_age_sec": ws_msg_age,
+                "ws_alive": ws_alive,
+                "market_ws_enabled": self._market_ws_enabled,
+                "poll_drives_entry": self._poll_drives_entry(),
+                "book_age_sec": book_age,
+                "clob_poll_ok": poll_ok,
+                "up_ask": st.get("up_ask"),
+                "down_ask": st.get("down_ask"),
+                "market_slug": (st.get("market_slug") or "")[-24:],
+            }
+        return out
+
+    def try_get_state(self, coin: str = "btc", *, lock_timeout: float = 0.5) -> Optional[Dict]:
+        """Non-blocking get_state for HTTP handlers — skip if feed lock is held."""
+        if coin not in self.markets:
+            return None
+        if not self.locks[coin].acquire(timeout=lock_timeout):
+            return None
+        try:
+            return self._get_state_unlocked(coin)
+        finally:
+            self.locks[coin].release()
+
     def get_state(self, coin: str = 'btc') -> Dict:
         """Get current market state for specified coin (thread-safe)"""
         if coin not in self.markets:
             return None
         with self.locks[coin]:
-            market = self.markets.get(coin)
-            if not market:
-                return None
-            
-            # Price only for BTC and ETH (SOL/XRP don't have price feeds)
-            if coin == 'btc':
-                price = self.btc_price
-            elif coin == 'eth':
-                price = self.eth_price
-            else:
-                price = 0.0  # SOL and XRP don't need price
-            
-            # Safe handling of None values
-            up_ask = market.get('up_ask') or 0.0
-            down_ask = market.get('down_ask') or 0.0
-            confidence = abs(down_ask - up_ask) if (up_ask > 0 and down_ask > 0) else 0.0
-            
-            return {
-                'up_ask': up_ask,
-                'down_ask': down_ask,
-                'up_ask_timestamp': market.get('up_ask_timestamp') or 0.0,
-                'down_ask_timestamp': market.get('down_ask_timestamp') or 0.0,
-                'price': price,
-                'market_start_price': market['market_start_price'],
-                'seconds_till_end': market['seconds_till_end'],
-                'market_slug': market['slug'],
-                'confidence': confidence,
-                'coin': coin,
-                'spot_price_source': self.spot_price_source,
-                'market_interval_sec': self.market_interval_sec,
-                'market_slug_suffix': self.market_slug_suffix,
-            }
+            return self._get_state_unlocked(coin)
+
+    def _get_state_unlocked(self, coin: str) -> Optional[Dict]:
+        """Caller must hold locks[coin]."""
+        market = self.markets.get(coin)
+        if not market:
+            return None
+
+        if coin == 'btc':
+            price = self.btc_price
+        elif coin == 'eth':
+            price = self.eth_price
+        else:
+            price = 0.0
+
+        up_ask = market.get('up_ask') or 0.0
+        down_ask = market.get('down_ask') or 0.0
+        confidence = abs(down_ask - up_ask) if (up_ask > 0 and down_ask > 0) else 0.0
+
+        now = int(time.time())
+        slug = self._current_slug(coin)
+        try:
+            slot = int(slug.rsplit("-", 1)[-1])
+            ste = max(0, slot + self.market_interval_sec - now)
+        except (ValueError, TypeError):
+            market_end = int(market.get("market_end_time") or 0)
+            ste = max(0, market_end - now) if market_end > 0 else 0
+
+        return {
+            'up_ask': up_ask,
+            'down_ask': down_ask,
+            'up_ask_timestamp': market.get('up_ask_timestamp') or 0.0,
+            'down_ask_timestamp': market.get('down_ask_timestamp') or 0.0,
+            'price': price,
+            'market_start_price': market['market_start_price'],
+            'seconds_till_end': ste,
+            'market_slug': slug,
+            'confidence': confidence,
+            'coin': coin,
+            'spot_price_source': self.spot_price_source,
+            'market_interval_sec': self.market_interval_sec,
+            'market_slug_suffix': self.market_slug_suffix,
+        }
     
     def register_price_callback(self, callback):
         """Register callback function for price updates (event-driven)"""
@@ -267,7 +696,455 @@ class DataFeed:
         iv = self.market_interval_sec
         current_slot = int(time.time()) // iv * iv
         return f"{coin}-updown-{self.market_slug_suffix}-{current_slot}"
-    
+
+    def _set_pm_ws(self, coin: str, ws: Any) -> None:
+        with self._pm_ws_lock[coin]:
+            self._pm_ws_app[coin] = ws
+
+    def _clear_pm_ws(self, coin: str) -> None:
+        with self._pm_ws_lock[coin]:
+            self._pm_ws_app[coin] = None
+
+    def _close_pm_ws(
+        self, coin: str, reason: str, *, source: str = "watchdog", force: bool = False
+    ) -> None:
+        """
+        Close market WS. Watchdog and trading-hours use separate paths so they
+        do not share cooldown or fight over the same connection.
+        """
+        with self._pm_ws_lock[coin]:
+            ws = self._pm_ws_app.get(coin)
+        if ws is None:
+            return
+        if source == "watchdog" and not force:
+            now = time.monotonic()
+            if now - self._pm_force_close_mono.get(coin, 0.0) < self._ws_force_close_cooldown_sec:
+                return
+            self._pm_force_close_mono[coin] = now
+            tag = "Watchdog"
+        else:
+            tag = "Hours"
+        try:
+            if hasattr(ws, "keep_running"):
+                ws.keep_running = False
+        except Exception:
+            pass
+        try:
+            sock = getattr(ws, "sock", None)
+            if sock is not None:
+                sock.close()
+        except Exception:
+            pass
+        try:
+            ws.close()
+        except Exception:
+            pass
+        self._clear_pm_ws(coin)
+        print(f"[PM-{coin.upper()}] {tag}: closing WS ({reason})")
+
+    def _force_pm_ws_reconnect(self, coin: str, reason: str, *, force: bool = False) -> None:
+        """Watchdog-only: close hung WS so _polymarket_worker can re-subscribe."""
+        self._close_pm_ws(coin, reason, source="watchdog", force=force)
+        if self.trading_hours.operations_active():
+            self._refresh_coin_book_rest(coin, fire_callbacks=False)
+
+    def _mark_book_fresh(self, coin: str) -> None:
+        """Mark book OK + publish UI cache. Caller must hold locks[coin]."""
+        self._last_book_ok_mono[coin] = time.monotonic()
+        self._publish_ui_state_unlocked(coin)
+
+    def _record_ask_pair(self, coin: str) -> None:
+        """Track when displayed UP/DN ask values actually change (not just timestamps)."""
+        with self.locks[coin]:
+            pair = (
+                round(float(self.markets[coin].get("up_ask") or 0), 4),
+                round(float(self.markets[coin].get("down_ask") or 0), 4),
+            )
+        if self._last_ask_pair.get(coin) != pair:
+            self._last_ask_pair[coin] = pair
+            self._last_ask_change_mono[coin] = time.monotonic()
+
+    def _ask_price_frozen_sec(self, coin: str) -> float:
+        last = self._last_ask_change_mono.get(coin, 0.0)
+        if last <= 0:
+            return 0.0
+        return time.monotonic() - last
+
+    def _ask_stale_age_sec(self, coin: str) -> float:
+        """
+        Seconds since last fresh UP/DN book.
+        Wall timestamps + monotonic fallback; slug set but ts=0 => stale (not 0).
+        """
+        now_wall = int(time.time())
+        last_mono = self._last_book_ok_mono.get(coin, 0.0)
+        mono_age = (time.monotonic() - last_mono) if last_mono > 0 else 0.0
+        with self.locks[coin]:
+            up_ts = float(self.markets[coin].get("up_ask_timestamp") or 0)
+            down_ts = float(self.markets[coin].get("down_ask_timestamp") or 0)
+            slug = (self.markets[coin].get("slug") or "").strip()
+        if up_ts > 0 or down_ts > 0:
+            wall_age = max(0.0, float(now_wall - max(up_ts, down_ts)))
+            return max(wall_age, mono_age)
+        if slug:
+            return max(mono_age, 999.0) if last_mono <= 0 else max(mono_age, self._watchdog_soft_rest_sec + 1.0)
+        return mono_age
+
+    def _recover_feeds_after_network(self, *, reason: str = "network_recovered") -> None:
+        """REST refresh + WS kick after proxy/VPN blip — unfreeze dashboard asks."""
+        if not self.trading_hours.operations_active():
+            return
+        print(
+            f"[PM-RECOVER] {reason} — resyncing markets"
+            + ("" if self._market_ws_enabled else " (poll-only)")
+        )
+        self._clob_rest_fail_streak = 0
+        fire = self._poll_drives_entry()
+        for coin in self.enabled_coins:
+            try:
+                expected = self._current_slug(coin)
+                with self.locks[coin]:
+                    stored = (self.markets[coin].get("slug") or "").strip()
+                if stored != expected or not stored:
+                    self._resync_market_from_gamma(coin, reason, force=True)
+                else:
+                    self._refresh_coin_book_rest(coin, fire_callbacks=fire)
+                    if self._market_ws_enabled:
+                        _present, ws_up = self._ws_socket_open(coin)
+                        if _present and not ws_up:
+                            self._close_pm_ws(
+                                coin, "zombie_sock_dead", source="watchdog", force=True
+                            )
+                        elif not ws_up:
+                            self._force_pm_ws_reconnect(coin, reason, force=True)
+            except Exception as exc:
+                print(f"[PM-RECOVER] {coin.upper()} failed: {exc}")
+
+    def _resync_market_from_gamma(
+        self, coin: str, reason: str, *, force: bool = False
+    ) -> bool:
+        """
+        Watchdog path: pull current Gamma tokens + slug when PM worker is stuck
+        on an old window (zombie WS — close() alone may not return run_forever).
+        """
+        if not self.trading_hours.operations_active():
+            return False
+        now_m = time.monotonic()
+        if not force and (
+            now_m - self._resync_throttle_mono.get(coin, 0.0)
+        ) < self._resync_throttle_sec:
+            return False
+        tokens = self._fetch_tokens(coin)
+        if not tokens:
+            return False
+        market_slug = self._current_slug(coin)
+        current_time = int(time.time())
+        iv = self.market_interval_sec
+        market_end = ((current_time // iv) * iv) + iv
+        with self.locks[coin]:
+            prev_slug = self.markets[coin].get("slug") or ""
+            if prev_slug != market_slug:
+                self.markets[coin]["market_start_price"] = 0.0
+                self.markets[coin]["up_ask_timestamp"] = 0.0
+                self.markets[coin]["down_ask_timestamp"] = 0.0
+            self.markets[coin]["slug"] = market_slug
+            self.markets[coin]["market_end_time"] = market_end
+            self.markets[coin]["tokens"] = tokens
+            self.markets[coin]["seconds_till_end"] = max(
+                0, market_end - current_time
+            )
+            if (
+                self.spot_price_source != "chainlink"
+                and self.markets[coin]["market_start_price"] == 0.0
+            ):
+                if coin == "btc":
+                    self.markets[coin]["market_start_price"] = self.btc_price
+                elif coin == "eth":
+                    self.markets[coin]["market_start_price"] = self.eth_price
+        self._register_market_tokens(coin, market_slug, tokens)
+        self._resync_throttle_mono[coin] = now_m
+        fire = self._poll_drives_entry()
+        self._refresh_coin_book_rest(coin, fire_callbacks=fire)
+        self._record_ask_pair(coin)
+        if self._market_ws_enabled:
+            self._force_pm_ws_reconnect(coin, f"resync {reason}", force=True)
+        print(
+            f"[PM-{coin.upper()}] Market resync → {market_slug} "
+            f"(ste={max(0, market_end - current_time)}s, {reason})"
+        )
+        return True
+
+    def _watchdog_may_run(self, coin: str) -> bool:
+        """False during non-trading hours or grace after resuming (avoid vs hours pause)."""
+        if not self.trading_hours.operations_active():
+            return False
+        resumed = self._pm_hours_resume_mono.get(coin, 0.0)
+        if resumed > 0 and (time.monotonic() - resumed) < self._ws_post_hours_grace_sec:
+            return False
+        return True
+
+    def _pm_ws_watchdog_check(self, coin: str) -> None:
+        """
+        A) slug behind current slot, or market window ended but WS worker stuck.
+        B) active window (seconds_till_end>0) but UP/DN ask timestamps too old.
+        Skipped outside trading_hours and shortly after hours resume.
+        """
+        if not self._watchdog_may_run(coin):
+            return
+        expected_slug = self._current_slug(coin)
+        now_wall = int(time.time())
+
+        with self.locks[coin]:
+            stored_slug = (self.markets[coin].get("slug") or "").strip()
+            ste = int(self.markets[coin].get("seconds_till_end") or 0)
+            market_end = int(self.markets[coin].get("market_end_time") or 0)
+
+        ws_present, ws_sock_ok = self._ws_socket_open(coin)
+        if ws_present and not ws_sock_ok:
+            print(
+                f"[PM-{coin.upper()}] Watchdog: zombie WS (app present, sock dead) "
+                f"— clearing for reconnect"
+            )
+            self._close_pm_ws(coin, "zombie_sock_dead", source="watchdog", force=True)
+            ws_present, ws_sock_ok = False, False
+        ws_up = ws_sock_ok
+
+        if not stored_slug:
+            if expected_slug:
+                if not self._resync_market_from_gamma(coin, "empty_slug"):
+                    if ws_up:
+                        self._force_pm_ws_reconnect(
+                            coin, "empty_slug", force=True
+                        )
+                    else:
+                        print(
+                            f"[PM-{coin.upper()}] Watchdog: slug empty, waiting for worker "
+                            f"(expected {expected_slug[-20:]})"
+                        )
+            return
+
+        stale_age = self._ask_stale_age_sec(coin)
+        rest_stale_thresh = self._ws_stale_ask_sec
+
+        if stored_slug != expected_slug:
+            self._watchdog_stale_streak[coin] = 0
+            drift_reason = (
+                f"slug_drift stored={stored_slug[-13:]} "
+                f"expected={expected_slug[-13:]}"
+            )
+            if not self._resync_market_from_gamma(coin, drift_reason):
+                self._force_pm_ws_reconnect(coin, drift_reason, force=True)
+            return
+
+        if market_end > 0 and now_wall > market_end + self._ws_window_ended_grace_sec:
+            self._watchdog_stale_streak[coin] = 0
+            end_reason = f"window_ended ste={ste} end={market_end}"
+            if not self._resync_market_from_gamma(coin, end_reason):
+                self._force_pm_ws_reconnect(coin, end_reason, force=True)
+            return
+
+        # WS down: on-demand REST only when ask is stale (not every watchdog tick).
+        if not ws_up:
+            if stale_age >= rest_stale_thresh:
+                self._watchdog_stale_streak[coin] += 1
+                self._watchdog_handle_stale_ask(coin, stale_age, ste, ws_was_up=False)
+            elif self._watchdog_soft_rest(coin, stale_age):
+                pass
+            return
+
+        if stale_age < rest_stale_thresh:
+            if self._watchdog_soft_rest(coin, stale_age):
+                self._watchdog_stale_streak[coin] = 0
+                return
+            self._watchdog_stale_streak[coin] = 0
+            return
+
+        self._watchdog_stale_streak[coin] += 1
+        self._watchdog_handle_stale_ask(coin, stale_age, ste, ws_was_up=True)
+
+    def _poll_only_watchdog_check(self, coin: str) -> None:
+        """Poll-only: slug/window resync + stale /prices refresh (no PM WS)."""
+        if not self._watchdog_may_run(coin):
+            return
+        expected_slug = self._current_slug(coin)
+        now_wall = int(time.time())
+        with self.locks[coin]:
+            stored_slug = (self.markets[coin].get("slug") or "").strip()
+            ste = int(self.markets[coin].get("seconds_till_end") or 0)
+            market_end = int(self.markets[coin].get("market_end_time") or 0)
+
+        if not stored_slug or stored_slug != expected_slug:
+            reason = (
+                "empty_slug"
+                if not stored_slug
+                else f"slug_drift {stored_slug[-13:]}→{expected_slug[-13:]}"
+            )
+            self._resync_market_from_gamma(coin, reason, force=not stored_slug)
+            return
+
+        if market_end > 0 and now_wall > market_end + self._ws_window_ended_grace_sec:
+            self._resync_market_from_gamma(
+                coin, f"window_ended ste={ste} end={market_end}", force=True
+            )
+            return
+
+        stale_age = self._ask_stale_age_sec(coin)
+        fire = self._poll_drives_entry()
+        if stale_age >= self._ws_stale_ask_sec:
+            if self._refresh_coin_book_rest(coin, fire_callbacks=fire):
+                self._clob_rest_fail_streak = 0
+            else:
+                self._clob_rest_fail_streak += 1
+            return
+
+        frozen = self._ask_price_frozen_sec(coin)
+        if ste > 0 and frozen >= self._ask_frozen_sec:
+            before = self._last_ask_pair.get(coin) or (0.0, 0.0)
+            if self._refresh_coin_book_rest(coin, fire_callbacks=fire):
+                self._record_ask_pair(coin)
+                if self._last_ask_pair.get(coin) != before:
+                    return
+            if frozen >= self._ask_frozen_sec * 2:
+                self._resync_market_from_gamma(
+                    coin, f"ask_frozen {frozen:.0f}s", force=True
+                )
+
+    def _watchdog_handle_frozen_prices(self, coin: str) -> None:
+        """
+        WS zombie can keep timestamps fresh while ask values freeze on the UI.
+        Force REST/resync when UP/DN prices are unchanged too long.
+        """
+        if not self._watchdog_may_run(coin):
+            return
+        with self.locks[coin]:
+            ste = int(self.markets[coin].get("seconds_till_end") or 0)
+        if ste <= 0:
+            return
+        frozen = self._ask_price_frozen_sec(coin)
+        if frozen < self._ask_frozen_sec:
+            return
+        before = self._last_ask_pair.get(coin) or (0.0, 0.0)
+        if self._refresh_coin_book_rest(coin, fire_callbacks=False):
+            self._record_ask_pair(coin)
+            if self._last_ask_pair.get(coin) != before:
+                return
+        if frozen >= self._ask_frozen_sec * 2:
+            print(
+                f"[PM-{coin.upper()}] Watchdog: ask frozen {frozen:.0f}s "
+                f"({before[0]:.3f}/{before[1]:.3f}) — resync"
+            )
+            self._resync_market_from_gamma(
+                coin, f"ask_frozen {frozen:.0f}s", force=True
+            )
+        elif frozen >= self._ask_frozen_sec and self._clob_rest_fail_streak >= 3:
+            self._recover_feeds_after_network(
+                reason=f"ask_frozen {frozen:.0f}s rest_fail"
+            )
+
+    def _maybe_ui_book_refresh(self, coin: str) -> None:
+        """Periodic REST when CLOB poll is off — keeps dashboard ask moving."""
+        if self._clob_poll_sec > 0 or not self.trading_hours.operations_active():
+            return
+        expected = self._current_slug(coin)
+        with self.locks[coin]:
+            stored = (self.markets[coin].get("slug") or "").strip()
+        if stored and stored != expected:
+            self._resync_market_from_gamma(
+                coin, f"ui_drift {stored[-13:]}→{expected[-13:]}"
+            )
+            return
+        frozen = self._ask_price_frozen_sec(coin)
+        interval = self._ui_rest_interval_sec
+        if frozen >= self._ask_frozen_sec:
+            interval = min(3.0, interval)
+        now_m = time.monotonic()
+        if (now_m - self._ui_rest_mono.get(coin, 0.0)) < interval:
+            return
+        if self._refresh_coin_book_rest(coin, fire_callbacks=False):
+            self._record_ask_pair(coin)
+            self._ui_rest_mono[coin] = now_m
+
+    def _watchdog_soft_rest(self, coin: str, stale_age: float) -> bool:
+        """
+        Light REST refresh for UI when CLOB poll is off (saves traffic vs 0.35s poll).
+        Throttled per coin; does not force WS reconnect.
+        """
+        soft = self._watchdog_soft_rest_sec
+        if soft <= 0 or stale_age < soft:
+            return False
+        now_m = time.monotonic()
+        if (now_m - self._watchdog_soft_rest_mono.get(coin, 0.0)) < soft:
+            return False
+        if self._refresh_coin_book_rest(coin, fire_callbacks=False):
+            self._watchdog_soft_rest_mono[coin] = now_m
+            self._clob_rest_fail_streak = 0
+            if stale_age >= soft * 2:
+                print(
+                    f"[PM-{coin.upper()}] Watchdog: soft REST refresh "
+                    f"(ask stale {stale_age:.0f}s, UI/trading unfreeze)"
+                )
+            return True
+        self._clob_rest_fail_streak += 1
+        if self._clob_rest_fail_streak >= 3:
+            self._recover_feeds_after_network(
+                reason=f"soft_rest_fail x{self._clob_rest_fail_streak}"
+            )
+        return False
+
+    def _watchdog_handle_stale_ask(
+        self,
+        coin: str,
+        stale_age: float,
+        ste: int,
+        *,
+        ws_was_up: bool,
+    ) -> None:
+        """On-demand REST + WS reconnect after network blip; throttled strategy callback."""
+        touched = self._refresh_coin_book_rest(coin, fire_callbacks=False)
+        now_m = time.monotonic()
+        if touched:
+            self._clob_rest_fail_streak = 0
+            if (now_m - self._watchdog_callback_mono.get(coin, 0.0)) >= 2.0:
+                self._fire_price_callbacks(coin)
+                self._watchdog_callback_mono[coin] = now_m
+        else:
+            self._clob_rest_fail_streak += 1
+        tag = "ws_down" if not ws_was_up else "stale_ask"
+        if ws_was_up:
+            self._force_pm_ws_reconnect(
+                coin,
+                f"{tag} {stale_age:.0f}s (ste={ste})"
+                + ("" if touched else ", rest_failed"),
+                force=(not touched or stale_age >= self._ws_stale_ask_sec * 2),
+            )
+        elif self._watchdog_stale_streak.get(coin, 0) >= 2:
+            print(
+                f"[PM-{coin.upper()}] Watchdog: WS down, stale {stale_age:.0f}s "
+                f"— PM worker reconnecting"
+            )
+        if self._watchdog_stale_streak.get(coin, 0) >= 3:
+            self._recover_feeds_after_network(
+                reason=f"watchdog_stale x{self._watchdog_stale_streak[coin]} "
+                f"({tag} {stale_age:.0f}s)"
+            )
+            self._watchdog_stale_streak[coin] = 0
+
+    def _pm_ws_watchdog_worker(self) -> None:
+        while not self.stop_event.is_set():
+            if not self.trading_hours.operations_active():
+                self.trading_hours.sleep_until_allowed(self.stop_event, max_sleep=60.0)
+                continue
+            try:
+                for coin in self.enabled_coins:
+                    if self._market_ws_enabled:
+                        self._pm_ws_watchdog_check(coin)
+                        self._watchdog_handle_frozen_prices(coin)
+                        self._maybe_ui_book_refresh(coin)
+                    else:
+                        self._poll_only_watchdog_check(coin)
+            except Exception as exc:
+                print(f"[PM-WATCHDOG] {exc}")
+            self.stop_event.wait(self._ws_watchdog_interval_sec)
+
     def _fetch_tokens(self, coin: str) -> Optional[Dict]:
         """Fetch current market tokens from Polymarket for specified coin"""
         try:
@@ -277,7 +1154,7 @@ class DataFeed:
             # Use events API with specific slug
             url = f"{gamma_api}/events?slug={slug}"
             proxies = requests_proxies(self._proxy_url_override)
-            req_kw: Dict[str, Any] = {"timeout": 10}
+            req_kw: Dict[str, Any] = {"timeout": (3.0, 10)}
             if proxies:
                 req_kw["proxies"] = proxies
             resp = requests.get(url, **req_kw)
@@ -319,6 +1196,8 @@ class DataFeed:
             # Spot price fetched async — must NOT block WS connect (CoinGecko can hang/slow)
 
             def _spot_bg(c: str, slug: str) -> None:
+                if not self.trading_hours.operations_active():
+                    return
                 try:
                     spot = self._fetch_spot_for_coin(c, timeout=2.0)
                     if spot and spot > 0:
@@ -351,6 +1230,13 @@ class DataFeed:
         """Update live underlying spot for coin; returns price or 0."""
         if coin not in self.markets:
             return 0.0
+        if not self.trading_hours.operations_active():
+            with self.locks[coin]:
+                if coin == "btc":
+                    return float(self.btc_price or 0)
+                if coin == "eth":
+                    return float(self.eth_price or 0)
+            return 0.0
         spot = self._fetch_spot_for_coin(coin)
         if not spot or spot <= 0:
             return 0.0
@@ -361,9 +1247,33 @@ class DataFeed:
                 self.eth_price = spot
         return spot
     
+    def _wait_trading_hours(self, coin: str) -> bool:
+        """Return False if stop requested; skip Polymarket traffic until window opens."""
+        if self.trading_hours.operations_active():
+            if coin in self._hours_outside_logged:
+                self._pm_hours_resume_mono[coin] = time.monotonic()
+                self._hours_outside_logged.discard(coin)
+            return True
+        with self._pm_ws_lock[coin]:
+            ws = self._pm_ws_app.get(coin)
+        if ws is not None:
+            self._close_pm_ws(coin, "outside trading window", source="hours")
+        if coin not in self._hours_outside_logged:
+            nxt = self.trading_hours.next_window_start()
+            when = nxt.strftime("%H:%M") if nxt else "?"
+            print(
+                f"[HOURS] Outside trading window ({self.trading_hours.ranges_summary()}) "
+                f"— pausing PM feed for {coin.upper()} until {when} (watchdog idle)"
+            )
+            self._hours_outside_logged.add(coin)
+        self.trading_hours.sleep_until_allowed(self.stop_event, max_sleep=60.0)
+        return not self.stop_event.is_set()
+
     def _polymarket_worker(self, coin: str):
         """Polymarket WebSocket worker for specified coin"""
         while not self.stop_event.is_set():
+            if not self._wait_trading_hours(coin):
+                break
             # Fetch tokens
             tokens = self._fetch_tokens(coin)
             if not tokens:
@@ -396,6 +1306,9 @@ class DataFeed:
                 prev_slug = self.markets[coin].get("slug") or ""
                 if prev_slug != market_slug:
                     self.markets[coin]["market_start_price"] = 0.0
+                    # Avoid watchdog B firing on previous market's stale timestamps
+                    self.markets[coin]["up_ask_timestamp"] = 0.0
+                    self.markets[coin]["down_ask_timestamp"] = 0.0
                 self.markets[coin]['slug'] = market_slug
                 self.markets[coin]['market_end_time'] = market_end
                 self.markets[coin]['tokens'] = tokens
@@ -425,7 +1338,8 @@ class DataFeed:
             try:
                 ws_url = self.config['data_sources']['polymarket']['ws_url']
                 ws_ref = [None]  # Store ws reference for closing
-                
+                self._clear_pm_ws(coin)
+
                 ws = websocket.WebSocketApp(
                     ws_url,
                     on_message=lambda ws, msg: self._on_pm_message(msg, tokens, coin),
@@ -440,7 +1354,8 @@ class DataFeed:
                 )
                 
                 ws_ref[0] = ws
-                
+                self._set_pm_ws(coin, ws)
+
                 def on_open(ws):
                     # Polymarket docs: type must be lowercase "market" (not "MARKET").
                     sub_msg: Dict[str, Any] = {
@@ -471,19 +1386,23 @@ class DataFeed:
                 stop_checker.start()
 
                 _px = websocket_proxy_kwargs(self._proxy_url_override)
-                ws.run_forever(
-                    ping_interval=20,
-                    ping_timeout=10,
-                    skip_utf8_validation=True,
-                    **_px,
-                )
-                timer.cancel()
-                
+                try:
+                    ws.run_forever(
+                        ping_interval=20,
+                        ping_timeout=10,
+                        skip_utf8_validation=True,
+                        **_px,
+                    )
+                finally:
+                    timer.cancel()
+                    self._clear_pm_ws(coin)
+
                 # Stop immediately if stop_event is set
                 if self.stop_event.is_set():
                     break
-                
+
             except Exception as e:
+                self._clear_pm_ws(coin)
                 print(f"[PM-{coin.upper()}] Error: {e}")
                 time.sleep(5)
     
@@ -530,102 +1449,157 @@ class DataFeed:
             return None
         return f
 
-    def _fetch_clob_top_of_book(
-        self, token_id: str, timeout: float = 2.5
-    ) -> Tuple[Optional[float], Optional[float]]:
-        """REST fallback: best bid / best ask for one outcome token."""
+    def _price_side_from_block(
+        self, block: Any, side: str
+    ) -> Optional[float]:
+        if not isinstance(block, dict):
+            return None
+        raw = block.get(side) or block.get(side.upper()) or block.get(side.lower())
+        return self._parse_best_float(raw)
+
+    def _prices_block_for_token(self, data: Any, token_id: str) -> Optional[Dict]:
         tid = self._norm_token_id(token_id)
-        if not tid:
-            return None, None
+        if not tid or not isinstance(data, dict):
+            return None
+        block = data.get(tid) or data.get(str(tid))
+        if isinstance(block, dict):
+            return block
+        for key, val in data.items():
+            if self._norm_token_id(key) == tid and isinstance(val, dict):
+                return val
+        return None
+
+    def _fetch_clob_prices_batch(
+        self, up_token: str, down_token: str, timeout: float = 2.5
+    ) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
+        """
+        POST /prices — one request for UP/DOWN best bid (SELL) and ask (BUY).
+        """
+        up_tid = self._norm_token_id(up_token)
+        down_tid = self._norm_token_id(down_token)
+        if not up_tid or not down_tid:
+            return {}
+        body = [
+            {"token_id": up_tid, "side": "BUY"},
+            {"token_id": up_tid, "side": "SELL"},
+            {"token_id": down_tid, "side": "BUY"},
+            {"token_id": down_tid, "side": "SELL"},
+        ]
         try:
             proxies = requests_proxies(self._proxy_url_override)
-            req_kw: Dict[str, Any] = {"timeout": timeout}
+            req_kw: Dict[str, Any] = {"timeout": (2.0, timeout)}
             if proxies:
                 req_kw["proxies"] = proxies
-            url = f"{self._clob_host}/book"
-            resp = requests.get(url, params={"token_id": tid}, **req_kw)
+            resp = requests.post(
+                f"{self._clob_host}/prices",
+                json=body,
+                **req_kw,
+            )
             resp.raise_for_status()
             data = resp.json()
-            asks: List[Tuple[float, float]] = []
-            bids: List[Tuple[float, float]] = []
-            for ask in data.get("asks") or []:
-                if isinstance(ask, dict):
-                    p = float(ask.get("price", 0))
-                    s = float(ask.get("size", 0))
-                else:
-                    p = float(ask[0]) if len(ask) > 0 else 0
-                    s = float(ask[1]) if len(ask) > 1 else 0
-                if _MIN_TOKEN_PX <= p <= _MAX_TOKEN_PX and s > 0:
-                    asks.append((p, s))
-            for bid in data.get("bids") or []:
-                if isinstance(bid, dict):
-                    p = float(bid.get("price", 0))
-                    s = float(bid.get("size", 0))
-                else:
-                    p = float(bid[0]) if len(bid) > 0 else 0
-                    s = float(bid[1]) if len(bid) > 1 else 0
-                if _MIN_TOKEN_PX <= p <= _MAX_TOKEN_PX and s > 0:
-                    bids.append((p, s))
-            asks.sort(key=lambda x: x[0])
-            bids.sort(key=lambda x: x[0], reverse=True)
-            best_ask = asks[0][0] if asks else None
-            best_bid = bids[0][0] if bids else None
-            return best_bid, best_ask
+            up_block = self._prices_block_for_token(data, up_tid)
+            dn_block = self._prices_block_for_token(data, down_tid)
+            return {
+                "up": (
+                    self._price_side_from_block(up_block, "SELL"),
+                    self._price_side_from_block(up_block, "BUY"),
+                ),
+                "down": (
+                    self._price_side_from_block(dn_block, "SELL"),
+                    self._price_side_from_block(dn_block, "BUY"),
+                ),
+            }
         except Exception:
-            return None, None
+            return {}
 
     def _refresh_coin_book_rest(self, coin: str, fire_callbacks: bool = False) -> bool:
-        """Pull top-of-book via CLOB REST for current market tokens."""
+        """Pull best bid/ask via CLOB POST /prices for current market tokens."""
+        if not self.trading_hours.operations_active():
+            return False
+        self._sync_market_for_current_slug(coin, quiet=True)
         tokens = self._live_tokens(coin)
         if not tokens:
             return False
-        book: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
-
-        def _pull(side: str, tid: str) -> None:
-            book[side] = self._fetch_clob_top_of_book(tid, timeout=1.2)
-
-        t_up = threading.Thread(target=_pull, args=("up", tokens["up"]), daemon=True)
-        t_dn = threading.Thread(target=_pull, args=("down", tokens["down"]), daemon=True)
-        t_up.start()
-        t_dn.start()
-        t_up.join(timeout=2.5)
-        t_dn.join(timeout=2.5)
+        book = self._fetch_clob_prices_batch(tokens["up"], tokens["down"], timeout=2.5)
+        if not book:
+            return False
         up_bid, up_ask = book.get("up", (None, None))
         down_bid, down_ask = book.get("down", (None, None))
         changed = False
+        touched = False
         now = time.time()
         with self.locks[coin]:
-            if up_ask is not None and self.markets[coin]["up_ask"] != up_ask:
+            if up_ask is not None:
+                touched = True
+                if self.markets[coin]["up_ask"] != up_ask:
+                    changed = True
                 self.markets[coin]["up_ask"] = up_ask
                 self.markets[coin]["up_ask_timestamp"] = now
-                changed = True
-            if down_ask is not None and self.markets[coin]["down_ask"] != down_ask:
+            if down_ask is not None:
+                touched = True
+                if self.markets[coin]["down_ask"] != down_ask:
+                    changed = True
                 self.markets[coin]["down_ask"] = down_ask
                 self.markets[coin]["down_ask_timestamp"] = now
-                changed = True
-            if up_bid is not None and self.markets[coin]["up_bid"] != up_bid:
+            if up_bid is not None:
+                touched = True
+                if self.markets[coin]["up_bid"] != up_bid:
+                    changed = True
                 self.markets[coin]["up_bid"] = up_bid
                 self.markets[coin]["up_bid_timestamp"] = now
-                changed = True
-            if down_bid is not None and self.markets[coin]["down_bid"] != down_bid:
+            if down_bid is not None:
+                touched = True
+                if self.markets[coin]["down_bid"] != down_bid:
+                    changed = True
                 self.markets[coin]["down_bid"] = down_bid
                 self.markets[coin]["down_bid_timestamp"] = now
-                changed = True
-        if changed and fire_callbacks:
+            if touched:
+                self._mark_book_fresh(coin)
+        if touched:
+            self._record_ask_pair(coin)
+        if fire_callbacks and touched:
             self._fire_price_callbacks(coin)
-        return changed
+        return touched
 
     def _clob_poll_worker(self) -> None:
-        """Periodic REST refresh for web UI + get_state (no strategy callbacks — avoids thread storms)."""
+        """Periodic POST /prices — poll-only mode also drives entry/exit callbacks."""
         interval = max(0.25, self._clob_poll_sec)
+        drive_entry = self._poll_drives_entry()
+        logged_ok = False
         while not self.stop_event.is_set():
+            if not self.trading_hours.operations_active():
+                self.trading_hours.sleep_until_allowed(self.stop_event, max_sleep=60.0)
+                continue
+            any_ok = False
             for coin in self.enabled_coins:
                 if self.stop_event.is_set():
                     break
                 try:
-                    self._refresh_coin_book_rest(coin, fire_callbacks=False)
+                    if self._refresh_coin_book_rest(
+                        coin, fire_callbacks=drive_entry
+                    ):
+                        any_ok = True
                 except Exception:
                     pass
+            if any_ok:
+                if self._clob_rest_fail_streak >= 3:
+                    self._recover_feeds_after_network(
+                        reason=f"clob_rest_back after {self._clob_rest_fail_streak} failures"
+                    )
+                self._clob_rest_fail_streak = 0
+                self._last_clob_rest_ok_mono = time.monotonic()
+                if not logged_ok:
+                    for coin in self.enabled_coins:
+                        st = self.get_state(coin)
+                        if st and float(st.get("up_ask") or 0) > 0:
+                            print(
+                                f"[DATA] CLOB /prices OK — {coin.upper()} ask "
+                                f"{float(st['up_ask']):.3f}/{float(st['down_ask']):.3f}"
+                            )
+                            logged_ok = True
+                            break
+            else:
+                self._clob_rest_fail_streak += 1
             time.sleep(interval)
 
     def _apply_best_bid_ask(
@@ -644,24 +1618,30 @@ class DataFeed:
         ask_f = self._parse_best_float(best_ask)
         if bid_f is None and ask_f is None:
             return False
-        side = self._token_side(asset_id, tokens)
+        live = self._live_tokens(coin, fallback=tokens)
+        side = self._token_side(asset_id, live)
         if not side:
             return False
 
         price_changed = False
+        now = time.time()
         with self.locks[coin]:
             if ask_f is not None:
                 key = f"{side}_ask"
                 if self.markets[coin][key] != ask_f:
                     self.markets[coin][key] = ask_f
-                    self.markets[coin][f"{side}_ask_timestamp"] = time.time()
+                    self.markets[coin][f"{side}_ask_timestamp"] = now
                     price_changed = True
             if bid_f is not None:
                 key = f"{side}_bid"
                 if self.markets[coin][key] != bid_f:
                     self.markets[coin][key] = bid_f
-                    self.markets[coin][f"{side}_bid_timestamp"] = time.time()
+                    self.markets[coin][f"{side}_bid_timestamp"] = now
                     price_changed = True
+            if price_changed:
+                self._mark_book_fresh(coin)
+        if price_changed:
+            self._record_ask_pair(coin)
 
         return price_changed
 
@@ -726,6 +1706,7 @@ class DataFeed:
     def _on_pm_message(self, message: str, tokens: Dict, coin: str):
         """Parse Polymarket orderbook message for specified coin"""
         try:
+            self._last_pm_ws_msg_mono[coin] = time.monotonic()
             parsed = json.loads(message)
             events = parsed if isinstance(parsed, list) else [parsed]
             live = self._live_tokens(coin, fallback=tokens)
@@ -796,7 +1777,8 @@ class DataFeed:
 
         best_ask = asks[0] if asks else None
         best_bid = bids[0] if bids else None
-        side = self._token_side(data.get("asset_id", ""), tokens)
+        live = self._live_tokens(coin, fallback=tokens)
+        side = self._token_side(data.get("asset_id", ""), live)
         if not side:
             return
 
@@ -811,49 +1793,59 @@ class DataFeed:
             if best_ask:
                 price, _size = best_ask
                 if side == "up":
-                    self.markets[coin]["up_ask"] = price
-                    self.markets[coin]["up_ask_timestamp"] = now
+                    if price != old_up_ask:
+                        self.markets[coin]["up_ask"] = price
+                        self.markets[coin]["up_ask_timestamp"] = now
+                        price_changed = True
                     self.markets[coin]["up_asks_full"] = asks[:1]
                     self.markets[coin]["up_bids_full"] = bids[:5]
-                    if price != old_up_ask:
-                        price_changed = True
                 else:
-                    self.markets[coin]["down_ask"] = price
-                    self.markets[coin]["down_ask_timestamp"] = now
+                    if price != old_down_ask:
+                        self.markets[coin]["down_ask"] = price
+                        self.markets[coin]["down_ask_timestamp"] = now
+                        price_changed = True
                     self.markets[coin]["down_asks_full"] = asks[:1]
                     self.markets[coin]["down_bids_full"] = bids[:5]
-                    if price != old_down_ask:
-                        price_changed = True
 
             if best_bid:
                 price, _size = best_bid
                 if side == "up":
-                    self.markets[coin]["up_bid"] = price
-                    self.markets[coin]["up_bid_timestamp"] = now
+                    if price != old_up_bid:
+                        self.markets[coin]["up_bid"] = price
+                        self.markets[coin]["up_bid_timestamp"] = now
+                        price_changed = True
                     if not self.markets[coin]["up_bids_full"]:
                         self.markets[coin]["up_bids_full"] = bids[:5]
-                    if price != old_up_bid:
-                        price_changed = True
                 else:
-                    self.markets[coin]["down_bid"] = price
-                    self.markets[coin]["down_bid_timestamp"] = now
+                    if price != old_down_bid:
+                        self.markets[coin]["down_bid"] = price
+                        self.markets[coin]["down_bid_timestamp"] = now
+                        price_changed = True
                     if not self.markets[coin]["down_bids_full"]:
                         self.markets[coin]["down_bids_full"] = bids[:5]
-                    if price != old_down_bid:
-                        price_changed = True
+            if price_changed:
+                self._mark_book_fresh(coin)
+
+        if price_changed:
+            self._record_ask_pair(coin)
 
         if price_changed:
             self._fire_price_callbacks(coin)
 
     def _timer_worker(self):
-        """Update timer every second locally for all markets (per-coin locks)"""
+        """Update seconds_till_end every second (local clock; no network)."""
         while not self.stop_event.is_set():
             current_time = int(time.time())
-            # Update each coin's timer independently (fully parallel)
             for coin in self.enabled_coins:
                 with self.locks[coin]:
-                    market_end_time = self.markets[coin]['market_end_time']
-                    self.markets[coin]['seconds_till_end'] = max(0, market_end_time - current_time)
+                    market_end_time = int(self.markets[coin].get("market_end_time") or 0)
+                    if market_end_time > 0:
+                        self.markets[coin]["seconds_till_end"] = max(
+                            0, market_end_time - current_time
+                        )
+            if not self.trading_hours.operations_active():
+                self.trading_hours.sleep_until_allowed(self.stop_event, max_sleep=30.0)
+                continue
             time.sleep(1)
     
     def _user_channel_worker(self):

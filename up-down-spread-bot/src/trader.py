@@ -4,7 +4,7 @@ Position management with support for multiple entries per market
 import time
 import json
 import threading
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 from pathlib import Path
 
 from spot_price import fetch_coin_spot_usd, fetch_spot_usd
@@ -569,8 +569,16 @@ class Trader:
         
         # Logging
         self.log_dir = Path(log_dir)
+        self.strategy_name = self.log_dir.name
         self.trades_file = self.log_dir / "trades.jsonl"
         self.session_file = self.log_dir / "session.json"
+        self._trade_db = None
+        try:
+            from trade_db import get_trade_database
+
+            self._trade_db = get_trade_database(config)
+        except Exception as e:
+            print(f"[TRADER] ⚠ MySQL 交易库未启用: {e}")
         
         print(f"[TRADER] Initialized with ${capital:,.2f} capital")
         
@@ -582,15 +590,56 @@ class Trader:
         if delta:
             self.current_capital += float(delta)
     
-    def rewrite_trade_records_file(self) -> bool:
-        """Rewrite trades.jsonl — open + closed rows, one line per entry (record_key)."""
+    def _sync_trade_records_db(self, rows: list, *, async_write: bool = True) -> None:
+        """Persist rows to MySQL; failures are logged only (never block trading)."""
+        if not self._trade_db or not rows:
+            return
+
+        def _do_sync() -> None:
+            try:
+                from trade_storage import sync_trader_records_to_db
+
+                sync_trader_records_to_db(self, rows)
+            except Exception as e:
+                print(f"[TRADER] ⚠ MySQL 同步失败: {e}")
+
+        if async_write:
+            threading.Thread(
+                target=_do_sync,
+                daemon=True,
+                name=f"trade_db_sync_{self.strategy_name}",
+            ).start()
+        else:
+            _do_sync()
+
+    def _jsonl_backup_enabled(self) -> bool:
+        try:
+            from trade_storage import jsonl_backup_enabled
+
+            return jsonl_backup_enabled(self.config)
+        except Exception:
+            return True
+
+    def rewrite_trade_records_file(
+        self, db_sync_rows: Optional[Union[Dict, List[Dict]]] = None
+    ) -> bool:
+        """Persist trade rows — incremental MySQL upsert; optional full jsonl backup."""
+        rows = list(self.open_trade_records.values()) + list(self.closed_trades)
+        rows.sort(
+            key=lambda r: float(r.get("entry_time") or r.get("close_time") or 0),
+            reverse=True,
+        )
+        if db_sync_rows is not None:
+            if isinstance(db_sync_rows, dict):
+                to_sync = [db_sync_rows]
+            else:
+                to_sync = list(db_sync_rows)
+            if to_sync:
+                self._sync_trade_records_db(to_sync)
+        if not self._jsonl_backup_enabled():
+            return True
         try:
             self.trades_file.parent.mkdir(parents=True, exist_ok=True)
-            rows = list(self.open_trade_records.values()) + list(self.closed_trades)
-            rows.sort(
-                key=lambda r: float(r.get("entry_time") or r.get("close_time") or 0),
-                reverse=True,
-            )
             tmp = self.trades_file.with_suffix(".jsonl.tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 for t in rows:
@@ -665,6 +714,8 @@ class Trader:
         up_ask: float = None,
         down_ask: float = None,
         entry_reason: str = "normal",
+        window_range_high: float = None,
+        window_range_low: float = None,
     ) -> None:
         """Phase 1: one row per entry; flip_reverse does not overwrite first leg."""
         from trade_record import build_open_record, make_record_key
@@ -692,17 +743,27 @@ class Trader:
             down_shares=down_sh,
             total_cost=leg_cost,
             entry_reason=entry_reason,
+            up_ask_at_entry=up_ask,
+            down_ask_at_entry=down_ask,
+            window_range_high=window_range_high,
+            window_range_low=window_range_low,
         )
         record_key = rec.get("record_key") or make_record_key(
             market_slug, entry_reason, entry_time
         )
         self.open_trade_records[record_key] = rec
-        self.rewrite_trade_records_file()
+        self.rewrite_trade_records_file(rec)
         tag = rec.get("entry_label") or ""
         tag_s = f" | {tag}" if tag else ""
+        wr_s = ""
+        if window_range_high and window_range_low:
+            wr_s = (
+                f" | 前三分钟高${float(window_range_high):,.2f}"
+                f" 低${float(window_range_low):,.2f}"
+            )
         print(
             f"[TRADE-REC] 下单记录 {market_slug} | {side}{tag_s} | "
-            f"现货@${spot_at_entry:,.2f} | 浮动盈亏 ${unreal:+.2f}"
+            f"现货@${spot_at_entry:,.2f}{wr_s} | 浮动盈亏 ${unreal:+.2f}"
         )
 
     def _upsert_closed_trade(self, trade: Dict) -> None:
@@ -763,6 +824,7 @@ class Trader:
         from trade_record import apply_chainlink_labels, finalize_settlement
 
         last: Optional[Dict] = None
+        updated_rows: List[Dict] = []
         for key in self._record_keys_for_slug(market_slug):
             trade = self.open_trade_records.pop(key, None)
             if trade is None:
@@ -782,6 +844,7 @@ class Trader:
                     settlement_winner=winner,
                 )
             self._upsert_closed_trade(trade)
+            updated_rows.append(trade)
             last = trade
         for i, t in enumerate(self.closed_trades):
             if t.get("market_slug") != market_slug:
@@ -801,90 +864,84 @@ class Trader:
                     settlement_winner=winner,
                 )
             self.closed_trades[i] = t
+            updated_rows.append(t)
             last = t
         if last is None:
             return None
-        self.rewrite_trade_records_file()
+        self.rewrite_trade_records_file(updated_rows)
         return last
 
     def load_previous_trades(self):
         """
-        Load previous trades from trades.jsonl to restore statistics
-        This allows bot to continue from where it left off after restart
+        Load previous trades — merge MySQL + trades.jsonl; upsert only missing rows.
         """
-        if not self.trades_file.exists():
-            print(f"[TRADER] No previous trades file found (this is OK for first run)")
-            return
-        
-        try:
-            loaded_count = 0
-            corrupted_lines = 0
-            
-            with open(self.trades_file, 'r') as f:
-                for line_num, line in enumerate(f, 1):
-                    line = line.strip()
-                    if not line:
-                        continue  # Skip empty lines
-                    
-                    try:
-                        trade = json.loads(line)
-                        
-                        # Validate trade has required fields
-                        if 'pnl' not in trade or 'market_slug' not in trade:
-                            print(f"[WARNING] Trade on line {line_num} missing required fields, skipping")
-                            corrupted_lines += 1
-                            continue
-                        from trade_record import make_record_key, record_row_key
+        from trade_storage import (
+            apply_merged_records_to_trader,
+            db_reads_enabled,
+            merge_trade_records,
+            sync_missing_records_to_db,
+        )
 
-                        slug = str(trade.get("market_slug") or "")
-                        if not trade.get("record_key"):
-                            trade["record_key"] = make_record_key(
-                                slug,
-                                trade.get("entry_reason"),
-                                float(trade.get("entry_time") or 0),
-                            )
-                        row_key = record_row_key(trade)
-                        if trade.get("is_open"):
-                            self.open_trade_records[row_key] = trade
-                        else:
-                            self.closed_trades.append(trade)
-                        loaded_count += 1
-                        
-                    except json.JSONDecodeError as e:
-                        print(f"[WARNING] Corrupted JSON on line {line_num}: {e}")
-                        corrupted_lines += 1
-                        continue
-            
-            if loaded_count > 0:
-                if self.rewrite_trade_records_file():
-                    print(
-                        f"[TRADER] ✓ trades.jsonl: {len(self.open_trade_records)} open, "
-                        f"{len(self.closed_trades)} closed"
-                    )
-                # Recalculate current capital from loaded trades
-                total_pnl = sum(t['pnl'] for t in self.closed_trades)
-                self.current_capital = self.starting_capital + total_pnl
-                
-                # Get stats
-                wins = sum(1 for t in self.closed_trades if self.infer_trade_outcome_win(t))
-                win_rate = (wins / loaded_count * 100) if loaded_count > 0 else 0
-                
-                print(f"[TRADER] ✓ Loaded {loaded_count} previous trade(s)")
-                print(f"[TRADER]   Cumulative PnL: ${total_pnl:+,.2f}")
-                print(f"[TRADER]   Win Rate: {win_rate:.1f}% ({wins}/{loaded_count})")
-                print(f"[TRADER]   Current Capital: ${self.current_capital:,.2f}")
-                
-                if corrupted_lines > 0:
-                    print(f"[TRADER] ⚠ Skipped {corrupted_lines} corrupted line(s)")
-            else:
-                print(f"[TRADER] No valid trades found in file")
-                
-        except Exception as e:
-            print(f"[TRADER] ⚠ Error loading previous trades: {e}")
-            print(f"[TRADER] Starting fresh with capital ${self.starting_capital:,.2f}")
-            # Reset to fresh state on error
-            self.closed_trades = []
-            self.current_capital = self.starting_capital
+        db_rows: list = []
+        if db_reads_enabled(self.config) and self._trade_db:
+            try:
+                db_rows = self._trade_db.load_records(
+                    strategy_name=self.strategy_name,
+                    limit=5000,
+                )
+            except Exception as e:
+                print(f"[TRADER] ⚠ 从 MySQL 加载失败: {e}")
+
+        jsonl_rows: list = []
+        if self.trades_file.exists():
+            try:
+                with open(self.trades_file, "r", encoding="utf-8") as f:
+                    for line_num, line in enumerate(f, 1):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            trade = json.loads(line)
+                        except json.JSONDecodeError as e:
+                            print(f"[WARNING] Corrupted JSON on line {line_num}: {e}")
+                            continue
+                        if trade.get("market_slug"):
+                            jsonl_rows.append(trade)
+            except OSError as e:
+                print(f"[TRADER] ⚠ 读取 trades.jsonl 失败: {e}")
+
+        merged = merge_trade_records(db_rows, jsonl_rows)
+        if not merged:
+            print(f"[TRADER] No previous trades found (first run)")
+            return
+
+        apply_merged_records_to_trader(self, merged)
+        synced = sync_missing_records_to_db(self, db_rows, merged)
+        if synced:
+            print(f"[TRADER] ✓ 增量补全 MySQL {synced} 条缺失记录")
+
+        loaded_count = len(merged)
+        total_pnl = sum(float(t.get("pnl") or 0) for t in self.closed_trades)
+        self.current_capital = self.starting_capital + total_pnl
+        wins = sum(1 for t in self.closed_trades if self.infer_trade_outcome_win(t))
+        closed_n = len(self.closed_trades)
+        win_rate = (wins / closed_n * 100) if closed_n > 0 else 0
+
+        source_bits = []
+        if db_rows:
+            source_bits.append(f"MySQL {len(db_rows)}")
+        if jsonl_rows:
+            source_bits.append(f"jsonl {len(jsonl_rows)}")
+        print(
+            f"[TRADER] ✓ 已加载 {loaded_count} 条交易 "
+            f"({', '.join(source_bits) or 'memory'}) — "
+            f"{len(self.open_trade_records)} open / {closed_n} closed"
+        )
+        print(f"[TRADER]   Cumulative PnL: ${total_pnl:+,.2f}")
+        if closed_n:
+            print(f"[TRADER]   Win Rate: {win_rate:.1f}% ({wins}/{closed_n})")
+        print(f"[TRADER]   Current Capital: ${self.current_capital:,.2f}")
+    
     
     def has_first_leg_for_flip_reverse(self, market_slug: str) -> bool:
         """True if market has a non-reverse open leg (eligible for flip reverse)."""
@@ -972,7 +1029,9 @@ class Trader:
                                  seconds_till_end: int = 0, time_from_start: int = 0,
                                  spot_at_entry: float = 0,
                                  market_spot_open: float = 0,
-                                 prefill_buy_result=None) -> bool:
+                                 prefill_buy_result=None,
+                                 window_range_high: float = None,
+                                 window_range_low: float = None) -> bool:
         """
         Enter a position by specifying number of contracts/shares
         🛡️ THREAD-SAFE: can be called from different threads
@@ -1027,6 +1086,8 @@ class Trader:
                 spot_at_entry=spot_at_entry,
                 market_spot_open=market_spot_open,
                 prefill_buy_result=prefill_buy_result,
+                window_range_high=window_range_high,
+                window_range_low=window_range_low,
             )
         finally:
             with self.lock:
@@ -1048,6 +1109,8 @@ class Trader:
         spot_at_entry: float = 0,
         market_spot_open: float = 0,
         prefill_buy_result=None,
+        window_range_high: float = None,
+        window_range_low: float = None,
     ) -> bool:
         """Place buy (I/O outside lock) then update positions under self.lock."""
         # Note: Market closure check now handled in main.py (market_start_prices)
@@ -1226,6 +1289,8 @@ class Trader:
                 up_ask=up_ask,
                 down_ask=down_ask,
                 entry_reason=entry_reason,
+                window_range_high=window_range_high,
+                window_range_low=window_range_low,
             )
         
         # Detailed logging for backtesting
@@ -1440,7 +1505,7 @@ class Trader:
         try:
             for row in settled:
                 self.closed_trades.append(row)
-            self.rewrite_trade_records_file()
+            self.rewrite_trade_records_file(settled)
             
             # 2. Mark market as closed to prevent re-entry
             self.closed_markets.add(market_slug)
@@ -1630,7 +1695,7 @@ class Trader:
             try:
                 for row in closed_rows:
                     self.closed_trades.append(row)
-                self.rewrite_trade_records_file()
+                self.rewrite_trade_records_file(closed_rows)
                 
                 # 3. Mark market as closed to prevent re-entry (skip if flip reverse follows)
                 if not keep_market_open_for_reentry:
@@ -2280,22 +2345,29 @@ class Trader:
         except OSError as e:
             print(f"[TRADER] ⚠️ entry journal write failed: {e}")
 
+    def _sync_one_trade_db(self, trade: Dict) -> None:
+        """Background-safe single-row MySQL upsert; never raises."""
+        if not self._trade_db:
+            return
+        try:
+            payload = dict(trade)
+            payload.setdefault("strategy_name", self.strategy_name)
+            self._trade_db.upsert_record(payload, strategy_name=self.strategy_name)
+        except Exception as e:
+            print(f"[TRADER] ⚠ MySQL 单行同步失败: {e}")
+
     def _log_trade(self, trade: Dict):
         """
-        Log trade to file with maximum fault tolerance
-        
-        CRITICAL: This function MUST succeed or raise exception!
-        If it fails silently, we lose trade data!
+        Log trade to file with maximum fault tolerance.
+        MySQL sync is best-effort and must not block or fail the trading path.
         """
         try:
-            # Ensure directory exists
             self.trades_file.parent.mkdir(parents=True, exist_ok=True)
-            
-            # Write to file with explicit flush
-            with open(self.trades_file, 'a') as f:
-                f.write(json.dumps(trade) + '\n')
-                f.flush()  # Force write to disk immediately
-                
+
+            if self._jsonl_backup_enabled():
+                with open(self.trades_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(trade) + "\n")
+                    f.flush()
         except PermissionError as e:
             print(f"[TRADER] ⚠️ PERMISSION ERROR logging trade: {e}")
             print(f"[TRADER] ⚠️ Trade data: {trade}")
@@ -2314,7 +2386,15 @@ class Trader:
             import traceback
             traceback.print_exc()
             raise  # Re-raise to prevent position deletion
-    
+
+        if self._trade_db:
+            threading.Thread(
+                target=self._sync_one_trade_db,
+                args=(trade,),
+                daemon=True,
+                name=f"trade_db_one_{self.strategy_name}",
+            ).start()
+
     def save_session(self):
         """Save current session state"""
         try:

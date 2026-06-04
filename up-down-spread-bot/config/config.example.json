@@ -5,6 +5,13 @@
     "max_orders_per_minute": 100,
     "max_total_investment": 1000.0
   },
+  "trading_hours": {
+    "enabled": false,
+    "ranges": [
+      "05:30-09:59",
+      "22:10-22:59"
+    ]
+  },
   "trading": {
     "btc": {
       "enabled": true,
@@ -34,6 +41,7 @@
     "min_window_range_usd": 15,
     "window_range_sample_sec": 5,
     "window_range_monitor_sec": 180,
+    "log_window_range_in_trades": true,
     "max_entries_per_market": 1,
     "entry_order_usd": 5,
     "max_investment_per_market": 10,
@@ -141,6 +149,13 @@
       "rtds_ws_url": "wss://ws-live-data.polymarket.com",
       "market_window": "5m",
       "chainlink_open_fetch_delay_sec": 30,
+      "clob_poll_interval_sec": 0.4,
+      "market_ws_enabled": false,
+      "ws_watchdog_interval_sec": 1,
+      "ws_stale_ask_sec": 15,
+      "ws_window_ended_grace_sec": 5,
+      "ws_force_close_cooldown_sec": 8,
+      "ws_post_hours_grace_sec": 45,
       "http_proxy": "",
       "websocket_custom_features": false
     }
@@ -155,5 +170,17 @@
   },
   "notifications": {
     "chart_every_n_markets": 10
+  },
+  "database": {
+    "enabled": true,
+    "host": "localhost",
+    "port": 3306,
+    "user": "root",
+    "password": "123456",
+    "database": "fy",
+    "table": "trade_records",
+    "read_from_db": true,
+    "jsonl_backup": false,
+    "connect_timeout_sec": 3
   }
 }

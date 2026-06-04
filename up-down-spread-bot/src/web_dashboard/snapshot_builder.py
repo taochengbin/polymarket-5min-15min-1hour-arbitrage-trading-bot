@@ -16,6 +16,56 @@ from trader import (
     _infer_spot_at_entry_from_trade,
 )
 from trade_record import apply_entry_labels
+from trading_hours import (
+    TradingHours,
+    dashboard_payload,
+    load_from_config_path,
+    merge_trading_status,
+)
+
+
+def _hours_for_dashboard(
+    config: Dict[str, Any], config_path: Optional[Path] = None
+) -> TradingHours:
+    if config_path is not None:
+        try:
+            return load_from_config_path(config_path)
+        except OSError:
+            pass
+    return TradingHours.from_config(config)
+
+
+def apply_trading_status_to_coins(
+    coins: Dict[str, Any], config_path: Path
+) -> Dict[str, Any]:
+    """Recompute trading_enabled / trading_reason for every coin from config.json."""
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except OSError:
+        return dict(coins or {})
+    hours = _hours_for_dashboard(cfg, config_path)
+    out: Dict[str, Any] = {}
+    for coin, row in (coins or {}).items():
+        merged_row = dict(row)
+        en, reason = _trading_flags(cfg, coin, hours=hours)
+        merged_row["trading_enabled"] = en
+        merged_row["trading_reason"] = reason
+        out[coin] = merged_row
+    return out
+
+
+def _trading_flags(
+    config: Dict[str, Any], coin: str, hours: Optional[TradingHours] = None
+) -> Tuple[bool, str]:
+    trading_cfg = config.get("trading", {}).get(coin, {})
+    if hours is None:
+        hours = TradingHours.from_config(config)
+    return merge_trading_status(
+        bool(trading_cfg.get("enabled", True)),
+        str(trading_cfg.get("reason") or ""),
+        hours,
+    )
 
 
 def _trade_sort_ts(trade: Dict) -> float:
@@ -444,7 +494,7 @@ def _load_entry_journal(log_dir: Path, strategy_name: str, coin: str) -> List[Di
 def _collect_closed_trades(
     multi_trader, *, read_trade_files: bool = True
 ) -> List[Dict[str, Any]]:
-    """Memory closed_trades first, then trades.jsonl — one record per market_slug."""
+    """Memory closed_trades first, then MySQL (or trades.jsonl fallback)."""
     by_slug: Dict[str, Dict[str, Any]] = {}
 
     def _merge(name: str, raw: Dict) -> None:
@@ -458,33 +508,17 @@ def _collect_closed_trades(
     for name, tr in multi_trader.traders.items():
         for trade in list(getattr(tr, "closed_trades", []) or []):
             _merge(name, trade)
-        if not read_trade_files:
-            continue
-        log_dir = getattr(tr, "log_dir", None)
-        if log_dir is None:
-            continue
-        path = Path(log_dir) / "trades.jsonl"
-        if not path.is_file():
-            continue
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        raw = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if "market_slug" not in raw:
-                        continue
-                    slug = str(raw.get("market_slug") or "")
-                    if slug in by_slug:
-                        by_slug[slug] = _merge_trade_row(by_slug[slug], raw)
-                        continue
-                    _merge(name, raw)
-        except OSError:
-            continue
+        if read_trade_files:
+            from trade_storage import load_persisted_records
+
+            for raw in load_persisted_records(tr, limit=0, config=getattr(tr, "config", None)):
+                if "market_slug" not in raw:
+                    continue
+                slug = str(raw.get("market_slug") or "")
+                if slug in by_slug:
+                    by_slug[slug] = _merge_trade_row(by_slug[slug], raw)
+                    continue
+                _merge(name, raw)
 
     return list(by_slug.values())
 
@@ -499,7 +533,7 @@ def _merge_trade_rows(
     limit: Optional[int] = 40,
     read_trade_files: bool = True,
 ) -> List[Dict[str, Any]]:
-    """One row per market_slug from trade_records (open + closed) in trades.jsonl."""
+    """One row per market_slug from trade_records (MySQL / memory)."""
     by_slug: Dict[str, Dict[str, Any]] = {}
 
     for name, tr in multi_trader.traders.items():
@@ -537,25 +571,14 @@ def _merge_trade_rows(
             _put_trade_by_slug(by_slug, row)
 
         if read_trade_files:
-            path = Path(getattr(tr, "log_dir", "")) / "trades.jsonl"
-            if path.is_file():
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        for line in f:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                raw = json.loads(line)
-                            except json.JSONDecodeError:
-                                continue
-                            if not raw.get("market_slug"):
-                                continue
-                            raw["strategy"] = name
-                            raw["coin"] = coin
-                            _put_trade_by_slug(by_slug, raw)
-                except OSError:
-                    pass
+            from trade_storage import load_persisted_records
+
+            for raw in load_persisted_records(tr, limit=0, config=getattr(tr, "config", None)):
+                if not raw.get("market_slug"):
+                    continue
+                raw["strategy"] = name
+                raw["coin"] = coin
+                _put_trade_by_slug(by_slug, raw)
 
     recent = sorted(by_slug.values(), key=_entry_sort_ts, reverse=True)
     if limit is not None:
@@ -568,44 +591,49 @@ def build_fast_coin_snapshot(
     coins: List[str],
     config: Dict[str, Any],
     data_feed,
+    config_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Lightweight coins block only — no trade merge, no detailed position stats."""
+    hours = _hours_for_dashboard(config, config_path)
     coin_blocks: Dict[str, Any] = {}
     for coin in coins:
-        st = data_feed.get_state(coin) if data_feed else None
-        trading_cfg = config.get("trading", {}).get(coin, {})
+        st = None
+        if data_feed and hasattr(data_feed, "peek_ui_state"):
+            st = data_feed.peek_ui_state(coin)
+        if not st and data_feed and hasattr(data_feed, "try_get_state"):
+            st = data_feed.try_get_state(coin, lock_timeout=0.25)
+        t_en, t_rs = _trading_flags(config, coin, hours=hours)
         if not st:
-            coin_blocks[coin] = {
-                "market_slug": "",
-                "seconds_till_end": 0,
-                "up_ask": 0.0,
-                "down_ask": 0.0,
-                "confidence": 0.0,
-                "price": 0.0,
-                "market_start_price": 0.0,
-                "favorite": "—",
-                "trading_enabled": bool(trading_cfg.get("enabled", True)),
-                "trading_reason": trading_cfg.get("reason") or "",
+            row: Dict[str, Any] = {
+                "trading_enabled": t_en,
+                "trading_reason": t_rs,
                 "stats": None,
                 "position": None,
             }
+            if data_feed and hasattr(data_feed, "_fresh_ste_for_coin"):
+                row["market_slug"] = data_feed._current_slug(coin)
+                row["seconds_till_end"] = int(data_feed._fresh_ste_for_coin(coin))
+            coin_blocks[coin] = row
             continue
         ua = float(st.get("up_ask") or 0)
         da = float(st.get("down_ask") or 0)
-        coin_blocks[coin] = {
+        row: Dict[str, Any] = {
             "market_slug": st.get("market_slug") or "",
             "seconds_till_end": int(st.get("seconds_till_end") or 0),
-            "up_ask": ua,
-            "down_ask": da,
             "confidence": float(st.get("confidence") or 0),
             "price": float(st.get("price") or 0),
             "market_start_price": float(st.get("market_start_price") or 0),
             "favorite": "UP" if ua > da else "DOWN",
-            "trading_enabled": bool(trading_cfg.get("enabled", True)),
-            "trading_reason": trading_cfg.get("reason") or "",
+            "trading_enabled": t_en,
+            "trading_reason": t_rs,
             "stats": None,
             "position": None,
         }
+        if ua > 0:
+            row["up_ask"] = ua
+        if da > 0:
+            row["down_ask"] = da
+        coin_blocks[coin] = row
     return coin_blocks
 
 
@@ -666,9 +694,15 @@ def _trim_rows_for_web(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "spot_label": spot_sym,
                 "market_slug": t.get("market_slug"),
                 "bet_side": t.get("bet_side") or "—",
+                "entry_ask": round(float(t.get("entry_ask") or t.get("token_ask") or 0), 4) or None,
+                "size_usd": round(float(t.get("size_usd") or t.get("total_cost") or 0), 2) or None,
+                "up_ask_at_entry": t.get("up_ask_at_entry"),
+                "down_ask_at_entry": t.get("down_ask_at_entry"),
                 "entry_reason": t.get("entry_reason") or "normal",
                 "entry_label": t.get("entry_label") or "",
                 "spot_at_entry": _order_spot(t),
+                "window_range_high": _spot_px(t.get("window_range_high")),
+                "window_range_low": _spot_px(t.get("window_range_low")),
                 "is_open": bool(t.get("is_open")),
                 "entry_time": float(t.get("entry_time") or 0) or None,
                 "entry_timestamp": t.get("entry_timestamp") or "",
@@ -698,7 +732,7 @@ def build_recent_trades_trimmed(
     read_trade_files: bool = True,
     limit: int = 40,
 ) -> List[Dict[str, Any]]:
-    """Merge memory + journal + trades.jsonl into web table rows."""
+    """Merge memory + MySQL into web table rows."""
     recent = _merge_trade_rows(
         multi_trader,
         strategy_base,
@@ -792,6 +826,53 @@ def query_trades_paginated(
         market_starts=market_starts,
         read_trade_files=read_trade_files,
     )
+    return _paginate_trade_rows(
+        all_rows,
+        page=page,
+        page_size=page_size,
+        date_from=date_from,
+        date_to=date_to,
+    )
+
+
+def query_trades_from_db_paginated(
+    *,
+    config: Dict[str, Any],
+    strategy_base: str,
+    coins: List[str],
+    page: int = 1,
+    page_size: int = 20,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Offline/history query directly from MySQL."""
+    from trade_storage import db_reads_enabled, load_records_for_strategies
+
+    if not db_reads_enabled(config):
+        return None
+    names = [f"{strategy_base}_{c}" for c in coins]
+    all_rows = load_records_for_strategies(config, names)
+    if not all_rows:
+        return None
+    _apply_display_labels(all_rows)
+    trimmed = _trim_rows_for_web(all_rows)
+    return _paginate_trade_rows(
+        trimmed,
+        page=page,
+        page_size=page_size,
+        date_from=date_from,
+        date_to=date_to,
+    )
+
+
+def _paginate_trade_rows(
+    all_rows: List[Dict[str, Any]],
+    *,
+    page: int = 1,
+    page_size: int = 20,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> Dict[str, Any]:
     filtered = filter_trades_by_entry_date(all_rows, date_from, date_to)
     filtered.sort(key=_entry_sort_ts, reverse=True)
     total = len(filtered)
@@ -818,6 +899,7 @@ def query_trades_paginated(
         "pending_settlement_count": pending,
         "date_from": date_from or "",
         "date_to": date_to or "",
+        "source": "mysql",
     }
 
 
@@ -829,6 +911,7 @@ def build_snapshot(
     data_feed,
     wallet_balance: Optional[float],
     config: Dict[str, Any],
+    config_path: Optional[Path] = None,
     session_start_time: float,
     dry_run: bool,
     markets_skipped: Dict[str, int],
@@ -846,6 +929,7 @@ def build_snapshot(
     tl = int(portfolio.get("total_losses", 0))
     tt = int(portfolio.get("total_trades", 0))
     port_wr = round((tw / tt * 100) if tt > 0 else 0.0, 2)
+    hours = _hours_for_dashboard(config, config_path)
 
     coin_blocks: Dict[str, Any] = {}
     for coin in coins:
@@ -854,6 +938,7 @@ def build_snapshot(
         trader = multi_trader.traders.get(trader_name)
 
         if not st:
+            t_en, t_rs = _trading_flags(config, coin, hours=hours)
             ms = {
                 "market_slug": "",
                 "seconds_till_end": 0,
@@ -863,10 +948,8 @@ def build_snapshot(
                 "price": 0.0,
                 "market_start_price": 0.0,
                 "favorite": "—",
-                "trading_enabled": bool(
-                    config.get("trading", {}).get(coin, {}).get("enabled", True)
-                ),
-                "trading_reason": config.get("trading", {}).get(coin, {}).get("reason") or "",
+                "trading_enabled": t_en,
+                "trading_reason": t_rs,
                 "stats": None,
                 "position": None,
             }
@@ -885,9 +968,9 @@ def build_snapshot(
         ua, da = ms["up_ask"], ms["down_ask"]
         ms["favorite"] = "UP" if ua > da else "DOWN"
 
-        trading_cfg = config.get("trading", {}).get(coin, {})
-        ms["trading_enabled"] = bool(trading_cfg.get("enabled", True))
-        ms["trading_reason"] = trading_cfg.get("reason") or ""
+        ms["trading_enabled"], ms["trading_reason"] = _trading_flags(
+            config, coin, hours=hours
+        )
 
         pos_detail = None
         if trader:
@@ -951,7 +1034,6 @@ def build_snapshot(
     exit_cfg = config.get("exit", {})
     pm = config.get("data_sources", {}).get("polymarket", {})
     market_interval_sec = int(pm.get("market_interval_sec", 900))
-
     return {
         "status": "running",
         "snapshot_ts": now,
@@ -986,6 +1068,7 @@ def build_snapshot(
             "max_total_investment": safety_cfg.get("max_total_investment"),
         },
         "flip_stop": exit_cfg.get("flip_stop", {}),
+        "trading_hours": dashboard_payload(hours),
         "coins": coin_blocks,
         "recent_trades": recent_trimmed,
     }

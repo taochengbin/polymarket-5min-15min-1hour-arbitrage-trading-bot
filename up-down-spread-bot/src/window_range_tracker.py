@@ -35,10 +35,12 @@ class WindowRangeTracker:
         min_range_usd: float = 0.0,
         sample_interval_sec: float = 5.0,
         monitor_sec: float = 180.0,
+        log_to_trades: bool = True,
     ):
         self.min_range_usd = float(min_range_usd or 0)
         self.sample_interval_sec = max(1.0, float(sample_interval_sec or 5))
         self.monitor_sec = max(0.0, float(monitor_sec or 0))
+        self.log_to_trades = bool(log_to_trades)
         self._states: Dict[str, Dict[str, _WindowRangeState]] = {}
         self._lock = threading.Lock()
         self._last_sample_mono: Dict[Tuple[str, str], float] = {}
@@ -46,6 +48,11 @@ class WindowRangeTracker:
 
     @property
     def enabled(self) -> bool:
+        """Run Chainlink sampling (filter and/or trade log fields)."""
+        return self.min_range_usd > 0 or self.log_to_trades
+
+    @property
+    def filter_enabled(self) -> bool:
         return self.min_range_usd > 0
 
     def on_open_locked(self, coin: str, slug: str, open_price: float) -> None:
@@ -150,7 +157,7 @@ class WindowRangeTracker:
         Before entry window: always allowed (not evaluated yet).
         In entry window: require range >= min_range_usd when enabled.
         """
-        if not self.enabled:
+        if not self.filter_enabled:
             return True, "disabled"
         if not in_entry_window:
             return True, "before_entry_window"
@@ -189,6 +196,23 @@ class WindowRangeTracker:
             "window_range_low": st.low,
         }
 
+    def fields_for_trade_record(
+        self, coin: str, slug: str, *, spot_now: float = 0.0
+    ) -> Dict[str, Optional[float]]:
+        """
+        Chainlink high/low since open lock (up to monitor_sec, default 3 min).
+        Optionally include spot_now so entry-time price is in the range.
+        """
+        if spot_now > 0:
+            self.record_sample(coin, slug, spot_now)
+        st = self._get_state(coin, slug)
+        if not st or st.open_price <= 0:
+            return {"window_range_high": None, "window_range_low": None}
+        return {
+            "window_range_high": round(float(st.high), 2),
+            "window_range_low": round(float(st.low), 2),
+        }
+
     def remove_market(self, coin: str, slug: str) -> None:
         c = (coin or "").strip().lower()
         with self._lock:
@@ -199,8 +223,15 @@ class WindowRangeTracker:
     @classmethod
     def from_config(cls, config: dict) -> WindowRangeTracker:
         sc = config.get("strategy") or {}
+        min_range = float(sc.get("min_window_range_usd", 0) or 0)
+        log_cfg = sc.get("log_window_range_in_trades")
+        if log_cfg is None:
+            log_to_trades = min_range > 0
+        else:
+            log_to_trades = bool(log_cfg)
         return cls(
-            min_range_usd=float(sc.get("min_window_range_usd", 0) or 0),
+            min_range_usd=min_range,
             sample_interval_sec=float(sc.get("window_range_sample_sec", 5) or 5),
             monitor_sec=float(sc.get("window_range_monitor_sec", 180) or 180),
+            log_to_trades=log_to_trades,
         )

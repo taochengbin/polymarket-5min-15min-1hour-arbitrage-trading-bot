@@ -58,7 +58,9 @@ class MultiTrader:
                       seconds_till_end: int = 0, time_from_start: int = 0,
                       spot_at_entry: float = 0,
                       market_spot_open: float = 0,
-                      prefill_buy_result=None) -> bool:
+                      prefill_buy_result=None,
+                      window_range_high: float = None,
+                      window_range_low: float = None) -> bool:
         """
         Enter position for specific strategy (isolated)
         
@@ -100,6 +102,8 @@ class MultiTrader:
                 spot_at_entry=spot_at_entry,
                 market_spot_open=market_spot_open,
                 prefill_buy_result=prefill_buy_result,
+                window_range_high=window_range_high,
+                window_range_low=window_range_low,
             )
         except Exception as e:
             print(f"[ERROR] {strategy_name} entry failed: {e}")

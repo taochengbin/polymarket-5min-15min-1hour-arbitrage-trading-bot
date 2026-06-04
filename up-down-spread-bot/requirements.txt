@@ -25,3 +25,6 @@ pytz>=2023.3
 
 # Web dashboard (optional: python main.py --web)
 flask>=3.0.0
+
+# MySQL trade records
+pymysql>=1.1.0

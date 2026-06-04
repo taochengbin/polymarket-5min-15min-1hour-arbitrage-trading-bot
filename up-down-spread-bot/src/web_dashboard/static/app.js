@@ -3,6 +3,7 @@
 
   const summaryEl = document.getElementById("summary-stats");
   const coinsEl = document.getElementById("coins-container");
+  const tradingHoursEl = document.getElementById("trading-hours-panel");
   const tbody = document.querySelector("#recent-trades tbody");
   const badge = document.getElementById("conn-badge");
   const configEditor = document.getElementById("config-editor");
@@ -37,6 +38,18 @@
     if (ml) {
       headerSubtitle.textContent = `Polymarket ${ml} desk \u00b7 live status \u00b7 settings \u00b7 analytics`;
     }
+  }
+
+  function fmtUsdPlain(n) {
+    if (n == null || Number.isNaN(n)) return EM;
+    return "$" + Number(n).toFixed(2);
+  }
+
+  function fmtAsk(n) {
+    if (n == null || Number.isNaN(n)) return EM;
+    const v = Number(n);
+    if (v <= 0) return EM;
+    return v.toFixed(3);
   }
 
   function fmtTime(sec) {
@@ -82,6 +95,40 @@
     return EM;
   }
 
+  function renderTradingHours(data) {
+    if (!tradingHoursEl) return;
+    const th = data.trading_hours || {};
+    if (!th.enabled) {
+      tradingHoursEl.innerHTML = `
+        <div class="trading-hours-head"><span class="label-muted">全天</span></div>
+        <div class="trading-hours-status active">未限制（24h）</div>`;
+      return;
+    }
+    const ranges = Array.isArray(th.ranges) ? th.ranges.filter(Boolean) : [];
+    const rangeHtml = ranges.length
+      ? ranges
+          .map((r) => `<div class="range-line">${escapeHtml(String(r))}</div>`)
+          .join("")
+      : `<div class="range-line">${escapeHtml(th.summary || EM)}</div>`;
+    const statusCls = th.allowed_now ? "active" : "paused";
+    const statusTxt = th.allowed_now ? "当前可交易" : "当前暂停";
+    const reason = (th.status_reason || "").trim();
+    const localT = (th.local_time || "").trim();
+    tradingHoursEl.innerHTML = `
+      <div class="trading-hours-ranges">${rangeHtml}</div>
+      <div class="trading-hours-status ${statusCls}">${escapeHtml(statusTxt)}</div>
+      ${
+        reason
+          ? `<div class="trading-hours-hint">${escapeHtml(reason)}</div>`
+          : ""
+      }
+      ${
+        localT
+          ? `<div class="trading-hours-hint label-muted">本机时间 ${escapeHtml(localT)}</div>`
+          : ""
+      }`;
+  }
+
   function renderSummary(data) {
     const p = data.portfolio || {};
     const dry = data.dry_run;
@@ -119,6 +166,7 @@
         const x = coins[c];
         if (!x) return "";
         const en = x.trading_enabled !== false;
+        const tradeHint = (x.trading_reason || "").trim();
         const fav = x.favorite || EM;
         const conf = x.confidence != null ? x.confidence.toFixed(3) : EM;
         const slugShort = (x.market_slug || "").split("-").pop() || EM;
@@ -140,8 +188,13 @@
         return `
         <div class="coin-card">
           <h3>${c.toUpperCase()}
-            ${en ? "" : '<span class="disabled-tag">disabled</span>'}
+            ${en ? "" : '<span class="disabled-tag">暂停</span>'}
           </h3>
+          ${
+            tradeHint
+              ? `<div class="row trading-hint"><span>交易状态</span><strong>${escapeHtml(tradeHint)}</strong></div>`
+              : ""
+          }
           <div class="row"><span>Market</span><strong>${escapeHtml(slugShort)}</strong></div>
           <div class="row"><span>Time left</span><strong>${fmtTime(x.seconds_till_end)}</strong></div>
           <div class="row"><span>UP / DN ask</span><strong>${x.up_ask?.toFixed(3) ?? EM} / ${x.down_ask?.toFixed(3) ?? EM}</strong></div>
@@ -166,8 +219,12 @@
       t.market_slug,
       t.is_open,
       t.bet_side,
+      t.entry_ask,
+      t.size_usd,
       t.entry_label,
       t.spot_at_entry,
+      t.window_range_high,
+      t.window_range_low,
       t.entry_timestamp || t.entry_time,
       t.spot_start,
       t.spot_end,
@@ -220,6 +277,13 @@
         const bet =
           (t.bet_side || EM) +
           (t.entry_label ? ` · ${t.entry_label}` : "");
+        const entryAsk =
+          t.entry_ask != null
+            ? t.entry_ask
+            : t.token_ask != null
+              ? t.token_ask
+              : null;
+        const orderUsd = t.size_usd != null ? t.size_usd : t.total_cost;
         const isOpen = t.is_open === true;
         const lbl = t.bet_result_label;
         const settledLbl =
@@ -235,7 +299,11 @@
         <td>${escapeHtml(sym)}</td>
         <td>${escapeHtml(m || "")}</td>
         <td>${escapeHtml(bet)}</td>
+        <td class="num">${escapeHtml(fmtAsk(entryAsk))}</td>
+        <td class="num">${escapeHtml(fmtUsdPlain(orderUsd))}</td>
         <td class="num">${escapeHtml(fmtSpot(t.spot_at_entry))}</td>
+        <td class="num">${escapeHtml(fmtSpot(t.window_range_high))}</td>
+        <td class="num">${escapeHtml(fmtSpot(t.window_range_low))}</td>
         <td class="num">${escapeHtml(fmtEntryTime(t))}</td>
         <td class="num">${escapeHtml(fmtSpot(t.spot_start))}</td>
         <td class="num">${escapeHtml(fmtSpot(t.spot_end))}</td>
@@ -246,7 +314,7 @@
       })
       .join("");
     if (!rows.length) {
-      tbody.innerHTML = '<tr><td colspan="11">暂无交易记录（下单后会显示持仓行）</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="15">暂无交易记录（下单后会显示持仓行）</td></tr>';
     }
   }
 
@@ -296,28 +364,54 @@
   }
 
   async function fetchStatus() {
-    const r = await fetch("/api/status", { cache: "no-store" });
+    const r = await fetch("/api/status", {
+      cache: "no-store",
+      signal: AbortSignal.timeout(8000),
+    });
     if (!r.ok) throw new Error("status " + r.status);
     return r.json();
   }
 
   let healthPoll = 0;
+  let lastGoodData = null;
+
+  function updateConnBadge(data) {
+    if (data.live_feed_ts && !data.feed_stale) {
+      badge.textContent = "live";
+      badge.className = "badge badge-ok";
+    } else if (data.live_feed_ts && data.feed_stale) {
+      badge.textContent = "ask stale";
+      badge.className = "badge badge-warn";
+    } else if (data.feed_stale) {
+      badge.textContent = "snapshot stale";
+      badge.className = "badge badge-warn";
+    } else {
+      badge.textContent = "connecting…";
+      badge.className = "badge badge-warn";
+    }
+  }
 
   async function tick() {
     try {
       const data = await fetchStatus();
+      lastGoodData = data;
       updateHeaderSubtitle(data);
       renderSummary(data);
+      renderTradingHours(data);
       renderCoins(data);
+      updateConnBadge(data);
       healthPoll += 1;
       if (healthPoll % 4 === 1) {
         await fetchTrades();
       }
-      if (healthPoll % 8 === 0) {
+      if (healthPoll % 8 === 0 && !data.live_feed_ts) {
         const health = await fetch("/api/health", { cache: "no-store" }).then((x) => x.json());
-        if (health.bot_live) {
-          badge.textContent = "live";
-          badge.className = "badge badge-ok";
+        if (health.feed_direct) {
+          badge.textContent = "bot on (no ask)";
+          badge.className = "badge badge-warn";
+        } else if (health.bot_live) {
+          badge.textContent = "file only";
+          badge.className = "badge badge-off";
         } else {
           badge.textContent = "no live bot";
           badge.className = "badge badge-off";
@@ -327,6 +421,11 @@
       badge.textContent = "disconnected";
       badge.className = "badge badge-warn";
       console.error("[WEB]", e);
+      if (lastGoodData) {
+        renderSummary(lastGoodData);
+        renderTradingHours(lastGoodData);
+        renderCoins(lastGoodData);
+      }
     }
   }
 
@@ -463,8 +562,96 @@
     }
   });
 
+  const askProfitHeadRow = document.getElementById("ask-profit-head-row");
+  const askProfitTbody = document.querySelector("#ask-profit-table tbody");
+  const askProfitStatus = document.getElementById("ask-profit-status");
+  const askProfitCustomEl = document.getElementById("ask-profit-custom-usd");
+  let askProfitFetchInFlight = false;
+
+  function fmtProfitCell(n) {
+    if (n == null || Number.isNaN(n)) return EM;
+    const v = Number(n);
+    const sign = v >= 0 ? "+" : "";
+    return sign + "$" + v.toFixed(2);
+  }
+
+  function renderAskProfitTable(data) {
+    if (!askProfitHeadRow || !askProfitTbody) return;
+    const amounts = data.amounts || [5, 25];
+    askProfitHeadRow.innerHTML =
+      "<th>Ask</th>" +
+      amounts
+        .map((a) => `<th>$${Number(a).toFixed(2)} 押中利润</th>`)
+        .join("");
+
+    const rows = data.rows || [];
+    askProfitTbody.innerHTML = rows
+      .map((row) => {
+        const ask = row.ask != null ? Number(row.ask).toFixed(2) : EM;
+        const cells = amounts
+          .map((a) => {
+            const key = String(Number(a).toFixed(2));
+            const altKey = String(a);
+            const cell =
+              (row.profits && (row.profits[key] || row.profits[altKey])) || null;
+            const profit = cell ? cell.profit_if_win : null;
+            const cls = profit != null && profit >= 0 ? "pnl-pos" : "pnl-neg";
+            return `<td class="num ${cls}">${escapeHtml(fmtProfitCell(profit))}</td>`;
+          })
+          .join("");
+        return `<tr><td class="num">${escapeHtml(ask)}</td>${cells}</tr>`;
+      })
+      .join("");
+
+    if (!rows.length) {
+      askProfitTbody.innerHTML = `<tr><td colspan="${amounts.length + 1}">暂无数据</td></tr>`;
+    }
+  }
+
+  async function fetchAskProfit() {
+    if (askProfitFetchInFlight) return;
+    askProfitFetchInFlight = true;
+    if (askProfitStatus) askProfitStatus.textContent = "加载中…";
+    try {
+      const q = new URLSearchParams({
+        amounts: "5,25",
+        ask_from: "0.65",
+        ask_to: "1",
+        ask_step: "0.01",
+      });
+      const custom = askProfitCustomEl?.value?.trim();
+      if (custom) q.set("custom_usd", custom);
+      const r = await fetch("/api/ask-profit?" + q.toString(), {
+        cache: "no-store",
+        signal: AbortSignal.timeout(15000),
+      });
+      const data = await r.json();
+      if (!r.ok || !data.ok) throw new Error(data.error || "ask-profit " + r.status);
+      renderAskProfitTable(data);
+      if (askProfitStatus) {
+        const hits = data.cache_hits ?? 0;
+        const misses = data.cache_misses ?? 0;
+        askProfitStatus.textContent =
+          misses > 0
+            ? `缓存命中 ${hits} · 新写入 ${misses}`
+            : `全部来自缓存 (${hits})`;
+      }
+    } catch (e) {
+      if (askProfitStatus) askProfitStatus.textContent = String(e.message || e);
+      console.error("[ASK-PROFIT]", e);
+    } finally {
+      askProfitFetchInFlight = false;
+    }
+  }
+
+  document.getElementById("btn-ask-profit-query")?.addEventListener("click", fetchAskProfit);
+  askProfitCustomEl?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") fetchAskProfit();
+  });
+
   loadConfig();
   tick();
   fetchTrades();
+  fetchAskProfit();
   setInterval(tick, 250);
 })();

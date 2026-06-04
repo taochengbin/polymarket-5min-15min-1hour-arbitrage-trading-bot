@@ -54,6 +54,7 @@ def try_reverse_hedge_entry(
     market_window_prices: Dict[str, Dict[str, Dict[str, Any]]],
     market_start_prices: Dict[str, Dict[str, float]],
     market_lock: threading.Lock,
+    window_range_tracker: Any = None,
 ) -> bool:
     """Place opposite-side hedge (entry_reason=flip_reverse). Returns True on success."""
     reverse_side = "DOWN" if first_leg_side == "UP" else "UP"
@@ -95,6 +96,15 @@ def try_reverse_hedge_entry(
     elif isinstance(tracked_open, (int, float)) and tracked_open > 0:
         market_spot_open = float(tracked_open)
 
+    wr_fields: Dict[str, Any] = {}
+    if window_range_tracker is not None and getattr(
+        window_range_tracker, "enabled", False
+    ):
+        wr_fields = window_range_tracker.fields_for_trade_record(
+            coin,
+            market_slug,
+            spot_now=float(spot_at_entry or market_state.get("price") or 0),
+        )
     success = multi_trader.enter_position(
         strategy_name=strategy_name,
         market_slug=market_slug,
@@ -107,6 +117,8 @@ def try_reverse_hedge_entry(
         seconds_till_end=int(market_state.get("seconds_till_end") or 0),
         spot_at_entry=spot_at_entry,
         market_spot_open=market_spot_open,
+        window_range_high=wr_fields.get("window_range_high"),
+        window_range_low=wr_fields.get("window_range_low"),
     )
     if success:
         strategy.mark_flip_reverse_placed(market_slug)
@@ -140,6 +152,7 @@ def maybe_reverse_hedge_entry(
     market_window_prices: Dict[str, Dict[str, Dict[str, Any]]],
     market_start_prices: Dict[str, Dict[str, float]],
     market_lock: threading.Lock,
+    window_range_tracker: Any = None,
 ) -> bool:
     """If price trigger met, place reverse hedge. True = entered or already done."""
     if not strategy:
@@ -192,6 +205,7 @@ def maybe_reverse_hedge_entry(
             market_window_prices=market_window_prices,
             market_start_prices=market_start_prices,
             market_lock=market_lock,
+            window_range_tracker=window_range_tracker,
         )
         if ok:
             with market_lock:

@@ -64,6 +64,10 @@ def build_open_record(
     down_shares: float = 0,
     total_cost: float = 0,
     entry_reason: str = "normal",
+    up_ask_at_entry: Optional[float] = None,
+    down_ask_at_entry: Optional[float] = None,
+    window_range_high: Optional[float] = None,
+    window_range_low: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Phase 1 — created at order fill."""
     ts = float(entry_time or time.time())
@@ -75,6 +79,9 @@ def build_open_record(
         "bet_side": bet_side,
         "spot_at_entry": round(float(spot_at_entry), 2) if spot_at_entry else 0,
         "token_ask": round(float(token_ask), 4) if token_ask else 0,
+        "entry_ask": round(float(token_ask), 4) if token_ask else 0,
+        "up_ask_at_entry": round(float(up_ask_at_entry), 4) if up_ask_at_entry is not None else None,
+        "down_ask_at_entry": round(float(down_ask_at_entry), 4) if down_ask_at_entry is not None else None,
         "contracts": round(float(contracts), 4),
         "size_usd": round(float(size_usd), 2),
         "total_cost": round(float(total_cost or size_usd), 2),
@@ -103,6 +110,16 @@ def build_open_record(
         "price_source": "pending",
         "entry_reason": er,
         "entry_label": entry_label_for(er),
+        "window_range_high": (
+            round(float(window_range_high), 2)
+            if window_range_high is not None and float(window_range_high) > 0
+            else None
+        ),
+        "window_range_low": (
+            round(float(window_range_low), 2)
+            if window_range_low is not None and float(window_range_low) > 0
+            else None
+        ),
     }
     return rec
 

@@ -11,60 +11,42 @@ from datetime import datetime
 
 from trader import Trader
 
-def load_trades(log_dir: str, coins: List[str]) -> Dict[str, List[Dict]]:
-    """Load all trades from JSONL files for each coin"""
-    all_trades = {}
-    
-    # DEBUG: Write to file too
-    debug_file = "/root/4coins_live/logs/chart_debug.log"
-    with open(debug_file, 'a') as f:
-        f.write(f"\n{'='*80}\n")
-        f.write(f"[CHART DEBUG] {datetime.now()} load_trades called\n")
-        f.write(f"[CHART DEBUG] log_dir = {log_dir}\n")
-        f.write(f"[CHART DEBUG] coins = {coins}\n")
-    
-    print(f"[CHART DEBUG] load_trades called")
-    print(f"[CHART DEBUG] log_dir = {log_dir}")
-    print(f"[CHART DEBUG] coins = {coins}")
-    
+def load_trades(log_dir: str, coins: List[str], config: Dict = None) -> Dict[str, List[Dict]]:
+    """Load closed trades for chart — MySQL when enabled, else trades.jsonl."""
+    from trade_storage import db_reads_enabled, load_records_for_strategies
+
+    all_trades: Dict[str, List[Dict]] = {c: [] for c in coins}
+    if config and db_reads_enabled(config):
+        names = [f"late_v3_{c}" for c in coins]
+        for row in load_records_for_strategies(config, names):
+            coin = str(row.get("coin") or "").lower()
+            if coin in all_trades and not row.get("is_open"):
+                all_trades[coin].append(row)
+        return all_trades
+
     for coin in coins:
         trades_file = Path(log_dir) / f"late_v3_{coin}" / "trades.jsonl"
         trades = []
-        
-        with open(debug_file, 'a') as f:
-            f.write(f"[CHART DEBUG] Looking for: {trades_file}\n")
-            f.write(f"[CHART DEBUG] File exists: {trades_file.exists()}\n")
-        
-        print(f"[CHART DEBUG] Looking for: {trades_file}")
-        print(f"[CHART DEBUG] File exists: {trades_file.exists()}")
-        
         if trades_file.exists():
-            with open(trades_file, 'r') as f:
+            with open(trades_file, 'r', encoding='utf-8') as f:
                 for line in f:
                     try:
-                        trade = json.loads(line.strip())
-                        trades.append(trade)
-                    except Exception as e:
-                        with open(debug_file, 'a') as df:
-                            df.write(f"[CHART DEBUG] Failed to parse line: {e}\n")
-                        print(f"[CHART DEBUG] Failed to parse line: {e}")
-            
-            with open(debug_file, 'a') as f:
-                f.write(f"[CHART DEBUG] Loaded {len(trades)} trades from {coin}\n")
-            print(f"[CHART DEBUG] Loaded {len(trades)} trades from {coin}")
-        else:
-            with open(debug_file, 'a') as f:
-                f.write(f"[CHART DEBUG] File NOT FOUND: {trades_file}\n")
-            print(f"[CHART DEBUG] File NOT FOUND: {trades_file}")
-        
+                        trades.append(json.loads(line.strip()))
+                    except Exception:
+                        continue
         all_trades[coin] = trades
-    
-    total = sum(len(t) for t in all_trades.values())
-    with open(debug_file, 'a') as f:
-        f.write(f"[CHART DEBUG] Total trades loaded: {total}\n")
-    print(f"[CHART DEBUG] Total trades loaded: {total}")
-    
     return all_trades
+
+
+def _load_chart_config() -> Dict:
+    cfg_path = Path(__file__).resolve().parent.parent / "config" / "config.json"
+    if not cfg_path.is_file():
+        return {}
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 def generate_pnl_chart(log_dir: str, coins: List[str], output_path: str) -> bool:
     """
@@ -81,7 +63,7 @@ def generate_pnl_chart(log_dir: str, coins: List[str], output_path: str) -> bool
     """
     try:
         # Load trades for all coins
-        all_trades = load_trades(log_dir, coins)
+        all_trades = load_trades(log_dir, coins, config=_load_chart_config())
         
         # Check if we have any trades
         total_trades = sum(len(trades) for trades in all_trades.values())
