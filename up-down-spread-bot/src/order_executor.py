@@ -598,6 +598,51 @@ class OrderExecutor:
         except Exception as e:
             print(f"[EXECUTOR] ⚠️ Failed to get fresh BID: {e}")
             return None
+
+    def _buy_token_dust_threshold(self) -> float:
+        return float(
+            self.config.get("execution", {}).get("sell", {}).get("min_dust_threshold", 0.1)
+            or 0.1
+        )
+
+    def reconcile_buy_fills_from_chain(
+        self,
+        token_id: str,
+        balance_at_start: Optional[float],
+        counted_contracts: float,
+        counted_usd: float,
+        price_estimate: float,
+    ) -> tuple:
+        """
+        Detect fills that landed on-chain but were missed by the CLOB API response.
+        Returns (contracts, usd_spent, ghost_detected).
+        """
+        dust = self._buy_token_dust_threshold()
+        if balance_at_start is None:
+            return counted_contracts, counted_usd, False
+
+        current = self.get_blockchain_token_balance(token_id)
+        if current is None:
+            return counted_contracts, counted_usd, False
+
+        chain_acquired = max(0.0, current - balance_at_start)
+        if chain_acquired <= counted_contracts + dust:
+            return counted_contracts, counted_usd, False
+
+        ghost = chain_acquired - counted_contracts
+        est_usd = round(ghost * price_estimate, 2)
+        print(
+            f"[EXECUTOR] 👻 Ghost fill on chain: +{ghost:.2f} contracts "
+            f"(chain {balance_at_start:.2f}→{current:.2f}, API counted {counted_contracts:.2f})"
+        )
+        from trade_logger import trades_logger
+
+        trades_logger.warning(
+            f"BUY_GHOST_FILL | token={str(token_id)[:16]}... | "
+            f"chain_delta={chain_acquired:.2f} | api_counted={counted_contracts:.2f} | "
+            f"ghost={ghost:.2f}"
+        )
+        return chain_acquired, counted_usd + est_usd, True
     
     def place_buy_order(self, market_slug: str, token_id: str, side: str, 
                        contracts: int, ask_price: float, coin: str = None) -> OrderResult:
@@ -675,6 +720,41 @@ class OrderExecutor:
         total_filled_contracts = 0.0
         total_spent_usd = 0.0
         start_time_total = time.time()
+        dust = self._buy_token_dust_threshold()
+        balance_at_start = self.get_blockchain_token_balance(token_id)
+        if balance_at_start is None:
+            print(
+                f"[EXECUTOR] ❌ BUY ABORTED: RPC unavailable after "
+                f"{self.rpc_retry_attempts} balance query attempts ({market_slug})"
+            )
+            from trade_logger import trades_logger
+
+            trades_logger.error(
+                f"BUY_ABORTED_RPC | Market: {market_slug} | Side: {side} | "
+                f"Reason: RPC_UNAVAILABLE_CANNOT_GET_BALANCE"
+            )
+            return OrderResult(
+                success=False,
+                error="RPC_UNAVAILABLE_CANNOT_GET_BALANCE",
+                filled_size=0.0,
+            )
+        if balance_at_start >= dust:
+            print(
+                f"[EXECUTOR] 🛑 SKIP BUY: already hold {balance_at_start:.2f} "
+                f"{side} contracts on chain (token {token_id[:16]}...)"
+            )
+            from trade_logger import trades_logger
+
+            trades_logger.warning(
+                f"BUY_SKIPPED_CHAIN_HOLDING | Market: {market_slug} | Side: {side} | "
+                f"Balance: {balance_at_start:.2f}"
+            )
+            return OrderResult(
+                success=False,
+                error="ALREADY_HOLD_TOKEN_ON_CHAIN",
+                filled_size=0.0,
+                remaining_balance=balance_at_start,
+            )
         
         # 🔥 RACE CONDITION PROTECTION #1: ATOMIC CHECK (highest priority!)
         # Check blocked_markets for THIS COIN FIRST before any operations
@@ -811,6 +891,22 @@ class OrderExecutor:
                     print(f"[EXECUTOR] ⚠ [FAK {fak_attempt}] FAILED: {error_msg}")
                     print(f"[EXECUTOR]   🔍 Full API response: {json.dumps(api_result, indent=2)}")
                     print(f"[EXECUTOR]   📋 Sent MarketOrderArgs: price=${normalized_price:.2f}, amount=${order_size_usd:.2f}, side=BUY, token={token_id}")
+
+                total_filled_contracts, total_spent_usd, ghost = (
+                    self.reconcile_buy_fills_from_chain(
+                        token_id,
+                        balance_at_start,
+                        total_filled_contracts,
+                        total_spent_usd,
+                        normalized_price,
+                    )
+                )
+                if ghost and total_filled_contracts >= target_contracts * TARGET_FILL_PERCENT:
+                    print(
+                        f"[EXECUTOR] ✅ Ghost fill reached target: "
+                        f"{total_filled_contracts:.2f}/{target_contracts}"
+                    )
+                    break
                 
                 # Pause before next FAK attempt
                 if fak_attempt < MAX_FAK_ATTEMPTS:
@@ -818,12 +914,29 @@ class OrderExecutor:
                     
             except Exception as e:
                 print(f"[EXECUTOR] ❌ [FAK {fak_attempt}] Exception: {e}")
-                    # Log failed attempt
+                total_filled_contracts, total_spent_usd, ghost = (
+                    self.reconcile_buy_fills_from_chain(
+                        token_id,
+                        balance_at_start,
+                        total_filled_contracts,
+                        total_spent_usd,
+                        normalized_price,
+                    )
+                )
+                if ghost and total_filled_contracts >= target_contracts * TARGET_FILL_PERCENT:
+                    break
                 if fak_attempt < MAX_FAK_ATTEMPTS:
                     time.sleep(RETRY_DELAY)
         
-        # After all FAK attempts - STOP!
+        # After all FAK attempts - final chain reconciliation
         elapsed_total_ms = int((time.time() - start_time_total) * 1000)
+        total_filled_contracts, total_spent_usd, _ = self.reconcile_buy_fills_from_chain(
+            token_id,
+            balance_at_start,
+            total_filled_contracts,
+            total_spent_usd,
+            normalized_price,
+        )
         
         if total_filled_contracts > 0:
             fill_pct = (total_filled_contracts / target_contracts) * 100

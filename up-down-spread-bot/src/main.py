@@ -2423,16 +2423,46 @@ def main(args=None):
                             window_range_low=wr_fields.get("window_range_low"),
                         )
                         if not success and hasattr(strategy, "release_reserved_entry"):
-                            strategy.release_reserved_entry(market_slug)
-                            if in_entry_window:
-                                entry_skip_tracker.note(
-                                    strategy_name,
-                                    coin,
-                                    market_slug,
-                                    "enter_failed",
-                                    snap,
-                                    in_entry_window=True,
-                                )
+                            # Do not release if chain already holds this outcome token
+                            chain_blocks_retry = False
+                            try:
+                                from trader import get_token_ids
+
+                                tids = get_token_ids(market_slug) or {}
+                                tid = tids.get(side)
+                                if tid and order_executor:
+                                    bal = order_executor.get_blockchain_token_balance(tid)
+                                    dust = float(
+                                        config.get("execution", {})
+                                        .get("sell", {})
+                                        .get("min_dust_threshold", 0.1)
+                                        or 0.1
+                                    )
+                                    if bal is not None and bal >= dust:
+                                        chain_blocks_retry = True
+                                        strategy.confirm_entry_success(
+                                            market_slug, side=side
+                                        )
+                                        entry_skip_tracker.mark_entered(
+                                            strategy_name, market_slug
+                                        )
+                                        print(
+                                            f"[ENTRY] 👻 enter failed but chain holds "
+                                            f"{bal:.2f} {side} — block retry ({market_slug})"
+                                        )
+                            except Exception as chain_chk_err:
+                                print(f"[ENTRY] ⚠ Chain hold check failed: {chain_chk_err}")
+                            if not chain_blocks_retry:
+                                strategy.release_reserved_entry(market_slug)
+                                if in_entry_window:
+                                    entry_skip_tracker.note(
+                                        strategy_name,
+                                        coin,
+                                        market_slug,
+                                        "enter_failed",
+                                        snap,
+                                        in_entry_window=True,
+                                    )
                         elif success and hasattr(strategy, "confirm_entry_success"):
                             strategy.confirm_entry_success(market_slug, side=side)
                             entry_skip_tracker.mark_entered(strategy_name, market_slug)

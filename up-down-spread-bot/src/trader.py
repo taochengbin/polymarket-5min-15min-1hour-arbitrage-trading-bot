@@ -20,6 +20,7 @@ _market_metadata_cache = {}  # {market_slug: {'condition_id': str, 'neg_risk': b
 
 # Persistent storage for metadata (critical for redeem after restart!)
 _METADATA_FILE = Path("logs/market_metadata.json")
+_CHAIN_TOKEN_DUST = 0.1
 
 
 def set_order_executor(executor):
@@ -1067,7 +1068,7 @@ class Trader:
                     for ent in pos.get("all_entries") or []:
                         if (ent.get("entry_reason") or "normal") != "flip_reverse":
                             if float(ent.get("shares") or 0) > 0:
-                                return False
+                                return True
             self._enter_in_flight[market_slug] = entry_reason or "normal"
 
         try:
@@ -1148,38 +1149,103 @@ class Trader:
             ask_price = up_ask if side == 'UP' else down_ask
             
             if token_id and ask_price:
-                print(f"[TRADER] ▶ {side:4s} @ ${price:.3f}  {shares:6.1f} contracts = ${size_usd:6.2f}  ({market_slug})")
-                
-                result = _order_executor.place_buy_order(
-                    market_slug=market_slug,
-                    token_id=token_id,
-                    side=side,
-                    contracts=contracts,
-                    ask_price=ask_price,
-                    coin=self.coin,
-                )
-                
-                if result.success:
-                    # ✅ SUCCESS! Using ACTUAL filled amounts
-                    actual_contracts = result.filled_size
-                    actual_cost = result.total_spent_usd
-                    
-                    if actual_contracts != contracts:
-                        print(f"[TRADER] ⚠ FAK partial fill: {actual_contracts:.2f}/{contracts} contracts")
-                    
-                    print(f"[TRADER] ✓ Order filled: {actual_contracts:.2f} contracts for ${actual_cost:.2f}")
-                    
-                elif not result.dry_run:
-                    # ❌ FAILED! Don't create position at all!
-                    print(f"[TRADER] ❌ Order FAILED for {side}: {result.error} - position NOT created")
+                chain_before = _order_executor.get_blockchain_token_balance(token_id)
+                if chain_before is None:
+                    print(
+                        f"[TRADER] ❌ RPC unavailable — skip buy this attempt "
+                        f"({market_slug} {side})"
+                    )
                     return False
+                chain_before_val = chain_before
+                mem_has_normal = False
+                pos0 = self.positions.get(market_slug)
+                if pos0:
+                    for ent in pos0.get("all_entries") or []:
+                        if (ent.get("entry_reason") or "normal") != "flip_reverse":
+                            if float(ent.get("shares") or 0) > 0:
+                                mem_has_normal = True
+                                break
+
+                if (
+                    entry_reason == "normal"
+                    and chain_before_val >= _CHAIN_TOKEN_DUST
+                    and not mem_has_normal
+                ):
+                    actual_contracts = chain_before_val
+                    actual_cost = round(chain_before_val * float(price), 2)
+                    print(
+                        f"[TRADER] 👻 Chain already holds {chain_before_val:.2f} {side} "
+                        f"— recover position, skip new buy ({market_slug})"
+                    )
+                elif (
+                    entry_reason == "normal"
+                    and chain_before_val >= _CHAIN_TOKEN_DUST
+                    and mem_has_normal
+                ):
+                    print(
+                        f"[TRADER] ✓ Already holding {side} on chain+memory "
+                        f"({chain_before_val:.2f}) — skip duplicate buy"
+                    )
+                    return True
+                else:
+                    print(f"[TRADER] ▶ {side:4s} @ ${price:.3f}  {shares:6.1f} contracts = ${size_usd:6.2f}  ({market_slug})")
+                    
+                    result = _order_executor.place_buy_order(
+                        market_slug=market_slug,
+                        token_id=token_id,
+                        side=side,
+                        contracts=contracts,
+                        ask_price=ask_price,
+                        coin=self.coin,
+                    )
+                    
+                    if result.success:
+                        actual_contracts = result.filled_size
+                        actual_cost = result.total_spent_usd
+                        
+                        if actual_contracts != contracts:
+                            print(f"[TRADER] ⚠ FAK partial fill: {actual_contracts:.2f}/{contracts} contracts")
+                        
+                        print(f"[TRADER] ✓ Order filled: {actual_contracts:.2f} contracts for ${actual_cost:.2f}")
+                    
+                    elif result.error == "ALREADY_HOLD_TOKEN_ON_CHAIN":
+                        hold_bal = float(result.remaining_balance or chain_before_val)
+                        if hold_bal >= _CHAIN_TOKEN_DUST:
+                            actual_contracts = hold_bal
+                            actual_cost = round(hold_bal * float(price), 2)
+                            print(
+                                f"[TRADER] 👻 Buy skipped — chain holds {hold_bal:.2f} "
+                                f"{side}, recovering position"
+                            )
+                        else:
+                            return False
+                    
+                    elif not result.dry_run:
+                        chain_after = _order_executor.get_blockchain_token_balance(token_id)
+                        chain_after_val = chain_after if chain_after is not None else 0.0
+                        chain_delta = max(0.0, chain_after_val - chain_before_val)
+                        if chain_delta >= _CHAIN_TOKEN_DUST:
+                            actual_contracts = chain_delta
+                            actual_cost = round(chain_delta * float(price), 2)
+                            print(
+                                f"[TRADER] 👻 Buy API failed but chain +{chain_delta:.2f} "
+                                f"{side} — recovering position"
+                            )
+                        else:
+                            print(f"[TRADER] ❌ Order FAILED for {side}: {result.error} - position NOT created")
+                            return False
         else:
             # DRY_RUN or no executor - just print
             print(f"[TRADER] ▶ {side:4s} @ ${price:.3f}  {shares:6.1f} shares = ${size_usd:6.2f}  ({market_slug})")
         
         with self.lock:
-            if market_slug in self.closed_markets:
+            if market_slug in self.closed_markets and actual_contracts <= 0:
                 return False
+            if market_slug in self.closed_markets and actual_contracts > 0:
+                print(
+                    f"[TRADER] ⚠ Market {market_slug} marked closed but recording "
+                    f"{actual_contracts:.2f} on-chain {side} fill"
+                )
             # NOW create position with ACTUAL values (or paper values if DRY_RUN)
             if market_slug not in self.positions:
                 self.positions[market_slug] = {
