@@ -40,9 +40,16 @@ def check_flip_stop_trigger(
     return False
 
 
+HEDGE_ENTRY_REASONS = frozenset({"flip_reverse", "second_entry"})
+
+
+def _is_hedge_entry_reason(entry_reason: Optional[str]) -> bool:
+    return (entry_reason or "") in HEDGE_ENTRY_REASONS
+
+
 def _first_leg_from_entries(all_entries: list) -> Optional[str]:
     for ent in all_entries or []:
-        if (ent.get("entry_reason") or "normal") == "flip_reverse":
+        if _is_hedge_entry_reason(ent.get("entry_reason")):
             continue
         s = (ent.get("side") or "").upper()
         if s in ("UP", "DOWN"):
@@ -51,9 +58,45 @@ def _first_leg_from_entries(all_entries: list) -> Optional[str]:
 
 
 def _has_flip_reverse_entry(all_entries: list) -> bool:
+    """True only for flip_reverse hedge — second_entry does not count."""
     return any(
-        (ent.get("entry_reason") or "") == "flip_reverse" for ent in (all_entries or [])
+        (ent.get("entry_reason") or "") == "flip_reverse"
+        for ent in (all_entries or [])
     )
+
+
+def _has_second_entry(all_entries: list) -> bool:
+    return any(
+        (ent.get("entry_reason") or "") == "second_entry"
+        for ent in (all_entries or [])
+    )
+
+
+def _second_entry_active(all_entries: list, *, entries_placed: int = 0) -> bool:
+    """True when second_entry hedge exists or was just placed (not flip_reverse)."""
+    entries = all_entries or []
+    if _has_second_entry(entries):
+        return True
+    if int(entries_placed or 0) >= 2 and not _has_flip_reverse_entry(entries):
+        return True
+    return False
+
+
+def _first_leg_shares_open(
+    *,
+    first_leg_side: Optional[str],
+    all_entries: Optional[list],
+    up_shares: float,
+    down_shares: float,
+) -> float:
+    first = (first_leg_side or "").upper() if first_leg_side else None
+    if not first:
+        first = _first_leg_from_entries(all_entries or [])
+    if first == "UP":
+        return float(up_shares or 0)
+    if first == "DOWN":
+        return float(down_shares or 0)
+    return 0.0
 
 
 def resolve_flip_stop_target(
@@ -65,25 +108,49 @@ def resolve_flip_stop_target(
     flip_reverse_done: bool = False,
     flip_stop_handled: bool = False,
     first_leg_side: Optional[str] = None,
+    up_shares: float = 0,
+    down_shares: float = 0,
+    entries_placed: int = 0,
 ) -> Optional[Dict[str, Any]]:
     """
     Which leg flip-stop monitors:
-    - first leg only → price_threshold
-    - after flip_reverse hedge → reverse_stop_price_threshold (defaults to price_threshold)
+    - first leg only when both legs may be open; second_entry leg never flip-stopped
+    - if only second_entry shares remain → no flip-stop (hold to settlement)
+    - after flip_reverse hedge only → reverse_stop_price_threshold
     """
     if flip_stop_handled:
         return None
     if not bool(flip_cfg.get("enabled", True)):
         return None
 
+    entries = all_entries or []
+    first = (first_leg_side or "").upper() if first_leg_side else None
+    if not first:
+        first = _first_leg_from_entries(entries)
+
+    second_active = _second_entry_active(entries, entries_placed=entries_placed)
+    if second_active:
+        if _first_leg_shares_open(
+            first_leg_side=first,
+            all_entries=entries,
+            up_shares=up_shares,
+            down_shares=down_shares,
+        ) <= 0:
+            return None
+
     first_thr = float(flip_cfg.get("price_threshold", 0.48))
     rev_thr_raw = float(flip_cfg.get("reverse_stop_price_threshold", 0) or 0)
     rev_thr = rev_thr_raw if rev_thr_raw > 0 else first_thr
 
-    has_rev = bool(flip_reverse_done) or _has_flip_reverse_entry(all_entries or [])
-    first = (first_leg_side or "").upper() if first_leg_side else None
+    has_rev = _has_flip_reverse_entry(entries)
+    if not has_rev and flip_reverse_done and not second_active:
+        # flip_reverse fill in flight — entries not appended yet
+        has_rev = True
+    if has_rev and second_active:
+        has_rev = False
+
     if not first:
-        first = _first_leg_from_entries(all_entries or [])
+        first = _first_leg_from_entries(entries)
 
     if has_rev:
         if not bool(flip_cfg.get("reverse_entry_enabled", False)):
@@ -166,13 +233,11 @@ class LateEntryStrategy:
         if self.market_interval_sec <= 0:
             self.market_interval_sec = 900
         
-        # Default entry window: ~last 4 min of 15m, ~last 2 min of 5m (override in config)
+        # Default entry window: ~last 4 min of 15m, ~last 2 min of 5m (only when config omits entry_window_sec)
         default_entry = 240 if self.market_interval_sec >= 900 else min(120, self.market_interval_sec - 10)
         raw_ew = int(strategy_cfg.get("entry_window_sec", default_entry))
-        # If config still has 15m-style values (e.g. 240) on a 5m market, use default_entry
-        if self.market_interval_sec < 900 and raw_ew > self.market_interval_sec * 0.5:
-            raw_ew = default_entry
-        self.entry_window = min(raw_ew, max(10, self.market_interval_sec - 5))
+        # Honor config as-is; only clamp to [10, market_interval - 5] so window fits market length
+        self.entry_window = max(10, min(raw_ew, self.market_interval_sec - 5))
         self.entry_freq = strategy_cfg.get('entry_frequency_sec', 7)
         self.min_confidence = strategy_cfg.get('min_confidence', 0.30)
         self.max_spread = strategy_cfg.get('max_spread', 1.05)
@@ -199,6 +264,25 @@ class LateEntryStrategy:
         
         # Max investment per market
         self.max_investment = strategy_cfg.get('max_investment_per_market', 300)
+
+        # second_entry_ask_threshold ← config strategy.second_entry.first_leg_ask_threshold
+        second_cfg = strategy_cfg.get("second_entry", {}) or {}
+        self.second_entry_enabled = bool(second_cfg.get("enabled", False))
+        self.second_entry_ask_threshold = float(
+            second_cfg.get("first_leg_ask_threshold", 0.85) or 0.85
+        )
+        hedge_thr = float(second_cfg.get("hedge_ask_threshold", 0) or 0)
+        self.second_entry_hedge_ask_threshold = (
+            hedge_thr
+            if hedge_thr > 0
+            else max(0.01, round(1.0 - self.second_entry_ask_threshold, 4))
+        )
+        self.second_entry_usd = float(second_cfg.get("order_usd", 0) or 0)
+        if self.second_entry_usd <= 0:
+            self.second_entry_usd = self.entry_order_usd
+        self.second_entry_max_spot_distance_usd = float(
+            second_cfg.get("max_spot_distance_from_open_usd", 100) or 100
+        )
         
         # Flip-stop price (price reversal protection)
         exit_cfg = config.get('exit', {})
@@ -234,15 +318,128 @@ class LateEntryStrategy:
         self._flip_reverse_pending: Dict[str, bool] = {}
         # Side of first normal entry (UP/DOWN) for reverse trigger
         self._first_leg_side: Dict[str, str] = {}
+        # Max first-leg token ask from normal entry until window end (for threshold analysis)
+        self._first_leg_ask_max: Dict[str, float] = {}
+        self._second_entry_hedge_track: Dict[str, bool] = {}
+        self._second_entry_hedge_ask_min: Dict[str, float] = {}
         # After flip-stop on first leg: no more normal entries this window
         self._flip_stop_handled: Dict[str, bool] = {}
         self._flip_stop_pending: Dict[str, bool] = {}
         self._state_lock = threading.Lock()
-        # Hard cap: 1 normal + 1 reverse hedge per market slug
+        # Hard cap: 1 normal + 1 hedge per market slug
         self.max_orders_per_market = 2
 
-    def orders_placed_count(self, market_slug: str) -> int:
-        return int(self._entries_placed.get(market_slug, 0) or 0)
+    def apply_second_entry_config_from(self, config: Dict) -> None:
+        """Reload second-entry params from config (each price tick)."""
+        second_cfg = config.get("strategy", {}).get("second_entry", {}) or {}
+        self.second_entry_enabled = bool(second_cfg.get("enabled", self.second_entry_enabled))
+        self.second_entry_ask_threshold = float(
+            second_cfg.get("first_leg_ask_threshold", self.second_entry_ask_threshold)
+            or self.second_entry_ask_threshold
+        )
+        hedge_thr = float(second_cfg.get("hedge_ask_threshold", 0) or 0)
+        if hedge_thr > 0:
+            self.second_entry_hedge_ask_threshold = hedge_thr
+        else:
+            self.second_entry_hedge_ask_threshold = max(
+                0.01, round(1.0 - self.second_entry_ask_threshold, 4)
+            )
+        self.second_entry_usd = float(second_cfg.get("order_usd", 0) or 0)
+        if self.second_entry_usd <= 0:
+            self.second_entry_usd = float(
+                config.get("strategy", {}).get("entry_order_usd", self.entry_order_usd)
+                or self.entry_order_usd
+            )
+        self.second_entry_max_spot_distance_usd = float(
+            second_cfg.get(
+                "max_spot_distance_from_open_usd",
+                self.second_entry_max_spot_distance_usd,
+            )
+            or self.second_entry_max_spot_distance_usd
+        )
+
+    def second_entry_pending(self, market_slug: str) -> bool:
+        """First leg confirmed; second leg not yet placed."""
+        if not self.second_entry_enabled:
+            return False
+        if self._flip_reverse_done.get(market_slug):
+            return False
+        if int(self._entries_placed.get(market_slug, 0) or 0) < 1:
+            return False
+        return bool(self.get_first_leg_side(market_slug))
+
+    def first_leg_live_ask(
+        self, market_slug: str, *, up_ask: float, down_ask: float
+    ) -> float:
+        """Real-time ask on the first-leg side (UP or DOWN), even after flip-stop."""
+        first = self.get_first_leg_side(market_slug)
+        if first == "UP":
+            return float(up_ask or 0)
+        if first == "DOWN":
+            return float(down_ask or 0)
+        return 0.0
+
+    def opposite_leg_live_ask(
+        self, market_slug: str, *, up_ask: float, down_ask: float
+    ) -> float:
+        """Real-time ask on the hedge (opposite) side of the first leg."""
+        first = self.get_first_leg_side(market_slug)
+        if first == "UP":
+            return float(down_ask or 0)
+        if first == "DOWN":
+            return float(up_ask or 0)
+        return 0.0
+
+    def second_entry_max_hedge_ask(self) -> float:
+        """Max hedge ask = 1 - first_leg_ask_threshold (from config), unless hedge_ask_threshold set."""
+        return float(self.second_entry_hedge_ask_threshold or 0)
+
+    def second_entry_allowed(
+        self,
+        market_slug: str,
+        *,
+        first_leg_live_ask: float,
+        opposite_live_ask: float,
+        spot_now: float,
+        spot_open: float,
+    ) -> tuple:
+        """Hedge when opposite live ask < 1 - first_leg_ask_threshold."""
+        if not self.second_entry_enabled:
+            return False, "second_entry_disabled"
+        if self._flip_reverse_done.get(market_slug):
+            return False, "second_entry_already_placed"
+        if self._flip_reverse_pending.get(market_slug):
+            return False, "second_entry_in_flight"
+        if self.orders_placed_count(market_slug) >= self.max_orders_per_market:
+            return False, "max_two_orders_per_market"
+        if self.orders_placed_count(market_slug) < 1:
+            return False, "need_first_leg_before_second"
+        first = self.get_first_leg_side(market_slug)
+        if not first:
+            return False, "no_first_leg"
+        if opposite_live_ask <= 0:
+            return False, "invalid_opposite_ask"
+        threshold = float(self.second_entry_ask_threshold)
+        max_hedge_ask = self.second_entry_max_hedge_ask()
+        if max_hedge_ask <= 0:
+            return False, "hedge_ask_threshold_missing"
+        if opposite_live_ask >= max_hedge_ask:
+            return False, (
+                f"hedge_ask_too_high({opposite_live_ask:.2f}>={max_hedge_ask:.2f},"
+                f"1-first_leg_ask_threshold={max_hedge_ask:.2f})"
+            )
+        if spot_open <= 0 or spot_now <= 0:
+            return False, "spot_missing"
+        max_dist = float(self.second_entry_max_spot_distance_usd)
+        if max_dist > 0:
+            dist = abs(spot_now - spot_open)
+            if dist >= max_dist:
+                return False, f"spot_distance_high({dist:.1f}>={max_dist:.0f})"
+        opp = "DOWN" if first == "UP" else "UP"
+        return True, (
+            f"opp {opp} ask {opposite_live_ask:.2f}<{max_hedge_ask:.2f} "
+            f"(1-first_leg_ask_threshold={threshold:.2f})"
+        )
 
     def apply_exit_config_from(self, config: Dict) -> None:
         """Reload flip/reverse params from config (each price tick)."""
@@ -266,10 +463,86 @@ class LateEntryStrategy:
         self.reverse_entry_price = (
             raw_rev_px if raw_rev_px > 0 else float(self.flip_stop_price)
         )
+        self.apply_second_entry_config_from(config)
+
+    def orders_placed_count(self, market_slug: str) -> int:
+        return int(self._entries_placed.get(market_slug, 0) or 0)
 
     def get_first_leg_side(self, market_slug: str) -> Optional[str]:
         s = (self._first_leg_side.get(market_slug) or "").upper()
         return s if s in ("UP", "DOWN") else None
+
+    def first_leg_ask_tracking_active(self, market_slug: str) -> bool:
+        """First leg filled; peak tracker active until market-end flush."""
+        if int(self._entries_placed.get(market_slug, 0) or 0) < 1:
+            return False
+        if not self.get_first_leg_side(market_slug):
+            return False
+        return market_slug in self._first_leg_ask_max
+
+    def start_first_leg_ask_tracking(self, market_slug: str, side: str) -> None:
+        """Track max live ask on first-leg side from after first fill until market end."""
+        s = (side or "").upper()
+        if s not in ("UP", "DOWN"):
+            return
+        self._first_leg_side[market_slug] = s
+        if market_slug not in self._first_leg_ask_max:
+            self._first_leg_ask_max[market_slug] = 0.0
+
+    def update_first_leg_ask_max(
+        self, market_slug: str, *, up_ask: float, down_ask: float
+    ) -> Optional[float]:
+        """Running max of first-leg direction live ask (up_ask or down_ask)."""
+        side = self.get_first_leg_side(market_slug)
+        if not side or market_slug not in self._first_leg_ask_max:
+            return None
+        px = float(up_ask if side == "UP" else down_ask)
+        if px <= 0:
+            cur = float(self._first_leg_ask_max.get(market_slug, 0) or 0)
+            return cur if cur > 0 else None
+        cur = float(self._first_leg_ask_max.get(market_slug, 0) or 0)
+        if px > cur:
+            self._first_leg_ask_max[market_slug] = px
+        return float(self._first_leg_ask_max[market_slug])
+
+    def get_first_leg_ask_max(self, market_slug: str) -> Optional[float]:
+        v = self._first_leg_ask_max.get(market_slug)
+        return float(v) if v is not None else None
+
+    def pop_first_leg_ask_max(self, market_slug: str) -> Optional[float]:
+        v = self._first_leg_ask_max.pop(market_slug, None)
+        return float(v) if v is not None else None
+
+    def start_second_entry_hedge_tracking(self, market_slug: str) -> None:
+        """Track min live hedge ask only while first leg is open (for analytics)."""
+        self._second_entry_hedge_track[market_slug] = True
+
+    def stop_second_entry_hedge_tracking(self, market_slug: str) -> None:
+        self._second_entry_hedge_track.pop(market_slug, None)
+
+    def update_second_entry_hedge_ask_min(
+        self, market_slug: str, *, up_ask: float, down_ask: float
+    ) -> Optional[float]:
+        if not self._second_entry_hedge_track.get(market_slug):
+            return None
+        if self._flip_reverse_done.get(market_slug):
+            return None
+        first = self.get_first_leg_side(market_slug)
+        if not first:
+            return None
+        hedge = float(down_ask if first == "UP" else up_ask)
+        if hedge <= 0:
+            v = self._second_entry_hedge_ask_min.get(market_slug)
+            return float(v) if v is not None else None
+        cur = float(self._second_entry_hedge_ask_min.get(market_slug, 0) or 0)
+        if cur <= 0 or hedge < cur:
+            self._second_entry_hedge_ask_min[market_slug] = hedge
+        return float(self._second_entry_hedge_ask_min[market_slug])
+
+    def pop_second_entry_hedge_ask_min(self, market_slug: str) -> Optional[float]:
+        self._second_entry_hedge_track.pop(market_slug, None)
+        v = self._second_entry_hedge_ask_min.pop(market_slug, None)
+        return float(v) if v is not None and float(v) > 0 else None
 
     def reverse_hedge_entry_allowed(
         self, market_slug: str, *, our_side: str, our_price: float
@@ -313,18 +586,28 @@ class LateEntryStrategy:
     def sync_entry_from_open_position(self, market_slug: str, trader: Any = None) -> None:
         if int(self._entries_placed.get(market_slug, 0) or 0) < 1:
             self._entries_placed[market_slug] = 1
-        if market_slug in self._first_leg_side or not trader:
+        if not trader:
             return
         pos = getattr(trader, "positions", {}).get(market_slug) or {}
         for ent in pos.get("all_entries") or []:
-            if (ent.get("entry_reason") or "normal") == "flip_reverse":
+            if _is_hedge_entry_reason(ent.get("entry_reason")):
                 continue
             s = (ent.get("side") or "").upper()
             if s in ("UP", "DOWN"):
-                self._first_leg_side[market_slug] = s
+                if market_slug not in self._first_leg_side:
+                    self._first_leg_side[market_slug] = s
+                if market_slug not in self._first_leg_ask_max:
+                    self.start_first_leg_ask_tracking(market_slug, s)
+                if market_slug not in self._second_entry_hedge_track:
+                    self.start_second_entry_hedge_tracking(market_slug)
                 break
 
-    def confirm_entry_success(self, market_slug: str, side: Optional[str] = None) -> None:
+    def confirm_entry_success(
+        self,
+        market_slug: str,
+        side: Optional[str] = None,
+        entry_ask: Optional[float] = None,
+    ) -> None:
         with self._state_lock:
             self._entry_signal_pending.pop(market_slug, None)
             self._entries_placed[market_slug] = (
@@ -333,6 +616,10 @@ class LateEntryStrategy:
             s = (side or "").upper()
             if s in ("UP", "DOWN") and market_slug not in self._first_leg_side:
                 self._first_leg_side[market_slug] = s
+            placed = int(self._entries_placed.get(market_slug, 0) or 0)
+            if placed == 1 and s in ("UP", "DOWN"):
+                self.start_first_leg_ask_tracking(market_slug, s)
+            self.start_second_entry_hedge_tracking(market_slug)
 
     def try_reserve_entry(self, market_slug: str) -> bool:
         """Atomically reserve entry slot before filters (prevents concurrent duplicate signals)."""
@@ -361,12 +648,13 @@ class LateEntryStrategy:
     def mark_flip_reverse_placed(self, market_slug: str) -> None:
         self._flip_reverse_pending.pop(market_slug, None)
         self._flip_reverse_done[market_slug] = True
+        self.stop_second_entry_hedge_tracking(market_slug)
         self._entries_placed[market_slug] = max(
             2, int(self._entries_placed.get(market_slug, 0) or 0)
         )
 
     def is_reverse_leg_only(self, market_slug: str) -> bool:
-        """After reverse entry: block another reverse hedge (flip-stop on hedge leg still allowed)."""
+        """After second_entry / flip_reverse hedge placed."""
         return bool(self._flip_reverse_done.get(market_slug))
 
     def resolve_flip_stop_target(
@@ -377,11 +665,15 @@ class LateEntryStrategy:
         down_ask: float,
         trader: Any = None,
     ) -> Optional[Dict[str, Any]]:
-        """Side/price/threshold for flip-stop (first leg or flip_reverse hedge leg)."""
+        """Flip-stop on first leg only; second_entry leg never flip-stopped."""
         all_entries: list = []
+        up_shares = 0.0
+        down_shares = 0.0
         if trader is not None:
             pos = getattr(trader, "positions", {}).get(market_slug) or {}
             all_entries = list(pos.get("all_entries") or [])
+            up_shares = float(pos.get("UP", {}).get("total_shares") or 0)
+            down_shares = float(pos.get("DOWN", {}).get("total_shares") or 0)
             if int(self._entries_placed.get(market_slug, 0) or 0) < 1:
                 self.sync_entry_from_open_position(market_slug, trader)
         flip_cfg = {
@@ -398,6 +690,9 @@ class LateEntryStrategy:
             flip_reverse_done=self.is_reverse_leg_only(market_slug),
             flip_stop_handled=bool(self._flip_stop_handled.get(market_slug)),
             first_leg_side=self.get_first_leg_side(market_slug),
+            up_shares=up_shares,
+            down_shares=down_shares,
+            entries_placed=int(self._entries_placed.get(market_slug, 0) or 0),
         )
 
     def try_begin_flip_stop(self, market_slug: str) -> bool:
@@ -688,6 +983,12 @@ class LateEntryStrategy:
             del self._flip_reverse_pending[market_slug]
         if market_slug in self._first_leg_side:
             del self._first_leg_side[market_slug]
+        if market_slug in self._first_leg_ask_max:
+            del self._first_leg_ask_max[market_slug]
+        if market_slug in self._second_entry_hedge_track:
+            del self._second_entry_hedge_track[market_slug]
+        if market_slug in self._second_entry_hedge_ask_min:
+            del self._second_entry_hedge_ask_min[market_slug]
         if market_slug in self._flip_stop_handled:
             del self._flip_stop_handled[market_slug]
         if market_slug in self._flip_stop_pending:

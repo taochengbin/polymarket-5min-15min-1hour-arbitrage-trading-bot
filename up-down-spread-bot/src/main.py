@@ -33,8 +33,10 @@ from trader import enrich_trade_record, apply_official_bet_result
 from spot_price import fetch_coin_spot_usd, fetch_spot_usd, spot_price_source_from_config
 from flip_reverse import execute_flip_stop_sell_only
 from reverse_entry import maybe_reverse_hedge_entry
+from second_entry import maybe_second_entry
 from window_range_tracker import WindowRangeTracker
 from entry_skip_tracker import EntrySkipTracker
+from first_leg_ask_analytics import flush_first_leg_ask_analytics, tick_first_leg_ask_max
 
 
 # Global configuration constants
@@ -319,7 +321,7 @@ def main(args=None):
         f"         Market window: \"{_mw_cfg or _iv_cfg}\" → {_iv_cfg}s "
         f"(edit data_sources.polymarket.market_window: \"5m\" or \"15m\")"
     )
-    print(f"         Entry window (config file): {config['strategy'].get('entry_window_sec', 'default')} seconds (strategy may cap to market length)")
+    print(f"         Entry window (config file): {config['strategy'].get('entry_window_sec', 'default')} seconds (uses config value; capped to market length if needed)")
     print(f"         Entry Frequency: Every {config['strategy']['entry_frequency_sec']} seconds")
     print(f"         Price Max: ${config['strategy']['price_max']}")
     _msm = float(config['strategy'].get('min_spot_move_usd', 0) or 0)
@@ -388,6 +390,18 @@ def main(args=None):
         )
     _first_stop = float(_flip_cfg.get("price_threshold") or 0.35)
     print(f"                  First-leg flip-stop: token ask ≤ ${_first_stop:.2f} → sell 1st leg")
+    _second_cfg = config.get("strategy", {}).get("second_entry", {}) or {}
+    if _second_cfg.get("enabled"):
+        _se_thr = float(_second_cfg.get("first_leg_ask_threshold", 0.85) or 0.85)
+        _se_usd = float(_second_cfg.get("order_usd", 0) or 0) or float(
+            config.get("strategy", {}).get("entry_order_usd") or 5
+        )
+        _se_spot = float(_second_cfg.get("max_spot_distance_from_open_usd", 100) or 100)
+        print(
+            f"         Second entry: 1st-leg side live ask > ${_se_thr:.2f} "
+            f"and |spot-open| < ${_se_spot:.0f} → buy opposite ~${_se_usd:.0f} "
+            f"(max 2 orders/market, ok after flip-stop)"
+        )
     _sz = config.get("strategy", {}).get("sizing", {})
     print(
         f"         Sizing: {_sz.get('above_180_sec', 8)}/{_sz.get('above_120_sec', 10)}/{_sz.get('below_120_sec', 12)} "
@@ -1627,6 +1641,14 @@ def main(args=None):
                         price_start = pending_info.get("price_start") or 0
                     if price_final <= 0:
                         price_final = pending_info.get("price_final") or 0
+
+                    flush_first_leg_ask_analytics(
+                        coin=coin,
+                        slug=prev_market,
+                        strategies=strategies,
+                        multi_trader=multi_trader,
+                        strategy_bases=STRATEGY_BASES,
+                    )
                     
                     # Close for all strategies
                     for base_name in STRATEGY_BASES:
@@ -1840,6 +1862,7 @@ def main(args=None):
                 market_windows=market_window_prices,
                 market_starts=market_start_prices,
                 read_trade_files=True,
+                strategies=strategies,
             )
             _web_recent_trades_cache = recent
             web_dashboard_state_mod.patch_recent_trades(recent)
@@ -1851,6 +1874,8 @@ def main(args=None):
             {
                 "multi_trader": multi_trader,
                 "strategy_base": STRATEGY_BASES[0],
+                "strategy_bases": STRATEGY_BASES,
+                "strategies": strategies,
                 "coins": COINS,
                 "data_feed": data_feed,
                 "proxy_url": _proxy_url,
@@ -1867,6 +1892,8 @@ def main(args=None):
     # ═══════════════════════════════════════════════════════════════
     # EVENT-DRIVEN CALLBACK - Called INSTANTLY on price changes
     # ═══════════════════════════════════════════════════════════════
+    _analytics_flushed_slugs: set = set()
+
     def on_price_update(coin: str, market_state: Dict):
         """
         Called on each successful POST /prices poll (or WS push when market_ws_enabled).
@@ -1884,7 +1911,29 @@ def main(args=None):
             if not market_slug:
                 return
 
+            _up_ask_tick = float(market_state.get("up_ask") or 0)
+            _down_ask_tick = float(market_state.get("down_ask") or 0)
+            tick_first_leg_ask_max(
+                coin=coin,
+                slug=market_slug,
+                up_ask=_up_ask_tick,
+                down_ask=_down_ask_tick,
+                strategies=strategies,
+                strategy_bases=STRATEGY_BASES,
+            )
+
             ste = int(market_state.get("seconds_till_end") or 0)
+            if ste <= 0 and market_slug not in _analytics_flushed_slugs:
+                flush_first_leg_ask_analytics(
+                    coin=coin,
+                    slug=market_slug,
+                    up_ask=_up_ask_tick,
+                    down_ask=_down_ask_tick,
+                    strategies=strategies,
+                    multi_trader=multi_trader,
+                    strategy_bases=STRATEGY_BASES,
+                )
+                _analytics_flushed_slugs.add(market_slug)
             _in_ew_global = 0 < ste <= _entry_window_sec_default
 
             def _skip_snap(state: Dict, ste_val: int) -> Dict:
@@ -1922,6 +1971,36 @@ def main(args=None):
                 if _in_ew_global:
                     _skip_all_strategies("invalid_prices", _skip_snap(market_state, ste))
                 return
+
+            # Second entry: after first leg fill, even if flip-stopped / no open position
+            if ste > 0:
+                for base_name in STRATEGY_BASES:
+                    strategy_name = f"{base_name}_{coin}"
+                    strategy = strategies.get(strategy_name)
+                    if not strategy or strategy.is_reverse_leg_only(market_slug):
+                        continue
+                    if not strategy.second_entry_pending(market_slug):
+                        continue
+                    try:
+                        if maybe_second_entry(
+                            config=config,
+                            strategy=strategy,
+                            multi_trader=multi_trader,
+                            strategy_name=strategy_name,
+                            market_slug=market_slug,
+                            coin=coin,
+                            up_ask=up_ask,
+                            down_ask=down_ask,
+                            market_state=market_state,
+                            data_feed=data_feed,
+                            market_window_prices=market_window_prices,
+                            market_start_prices=market_start_prices,
+                            market_lock=market_lock,
+                            window_range_tracker=window_range_tracker,
+                        ):
+                            return
+                    except Exception as e:
+                        print(f"[ERROR] Second entry check failed for {strategy_name}: {e}")
             
             # ═══════════════════════════════════════════════════════
             # THREAD-SAFE: Check market status
@@ -1963,6 +2042,8 @@ def main(args=None):
                     # PART 1: EXIT CHECKS (if we have a position)
                     # ═══════════════════════════════════════════════════════
                     if position_stats and position_stats.get('total_invested', 0) > 0:
+                        strategy = strategies.get(strategy_name)
+
                         # ─────────────────────────────────────────────────
                         # CRITICAL: Validate price freshness and synchronization
                         # Prevents false stop-loss triggers from stale/desync prices
@@ -1973,7 +2054,7 @@ def main(args=None):
                         is_valid, reason = validate_prices(up_ask, down_ask, up_ask_ts, down_ask_ts, coin)
                         
                         if not is_valid:
-                            # Prices invalid - skip ALL exit checks
+                            # Prices invalid - skip remaining exit checks (second entry already tried above)
                             print(f"[PRICE] ⚠️ {coin.upper()} prices invalid: {reason}, skipping exit checks")
                             continue
                         
@@ -1994,7 +2075,6 @@ def main(args=None):
                         if not our_side or not our_price:
                             continue  # No clear position
 
-                        strategy = strategies.get(strategy_name)
                         if strategy and not strategy.is_reverse_leg_only(market_slug):
                             if maybe_reverse_hedge_entry(
                                 config=config,
@@ -2198,21 +2278,27 @@ def main(args=None):
                             )
 
                             if result:
-                                try:
-                                    if isinstance(result, dict):
-                                        session_stats = multi_trader.get_session_stats(
-                                            strategy_name, markets_skipped[coin]
-                                        )
-                                        portfolio_stats = _get_portfolio_stats(
-                                            multi_trader, markets_skipped, session_start_time
-                                        )
-                                        notifier.send_market_closed(
-                                            coin, result, session_stats, portfolio_stats
-                                        )
-                                        total_completed_markets += 1
-                                except Exception as e:
-                                    print(f"[ERROR] Notification failed: {e}")
-                                return
+                                if result.get("second_leg_held"):
+                                    print(
+                                        f"[FLIP] {coin.upper()} first leg flip-stop; "
+                                        f"second_entry held to settlement | {market_slug}"
+                                    )
+                                else:
+                                    try:
+                                        if isinstance(result, dict):
+                                            session_stats = multi_trader.get_session_stats(
+                                                strategy_name, markets_skipped[coin]
+                                            )
+                                            portfolio_stats = _get_portfolio_stats(
+                                                multi_trader, markets_skipped, session_start_time
+                                            )
+                                            notifier.send_market_closed(
+                                                coin, result, session_stats, portfolio_stats
+                                            )
+                                            total_completed_markets += 1
+                                    except Exception as e:
+                                        print(f"[ERROR] Notification failed: {e}")
+                                    return
                     
                     # ═══════════════════════════════════════════════════════
                     # PART 2: ENTRY SIGNAL CHECK (real-time)
@@ -2441,7 +2527,7 @@ def main(args=None):
                                     if bal is not None and bal >= dust:
                                         chain_blocks_retry = True
                                         strategy.confirm_entry_success(
-                                            market_slug, side=side
+                                            market_slug, side=side, entry_ask=price
                                         )
                                         entry_skip_tracker.mark_entered(
                                             strategy_name, market_slug
@@ -2464,7 +2550,9 @@ def main(args=None):
                                         in_entry_window=True,
                                     )
                         elif success and hasattr(strategy, "confirm_entry_success"):
-                            strategy.confirm_entry_success(market_slug, side=side)
+                            strategy.confirm_entry_success(
+                                market_slug, side=side, entry_ask=price
+                            )
                             entry_skip_tracker.mark_entered(strategy_name, market_slug)
                         
                         if success and contracts > 0:
@@ -2732,6 +2820,13 @@ def main(args=None):
                             prev_market,
                             [f"{_bn}_{coin}" for _bn in STRATEGY_BASES],
                         )
+                        flush_first_leg_ask_analytics(
+                        coin=coin,
+                        slug=prev_market,
+                        strategies=strategies,
+                        multi_trader=multi_trader,
+                        strategy_bases=STRATEGY_BASES,
+                    )
                         del market_start_prices[coin][prev_market]
                         window_range_tracker.remove_market(coin, prev_market)
                         for _bn in STRATEGY_BASES:
@@ -2930,6 +3025,7 @@ def main(args=None):
                             read_trade_files=True,
                             skip_trade_merge=True,
                             recent_trades_cached=[],
+                            strategies=strategies,
                         )
                         web_dashboard_state_mod.set_snapshot(_snap)
                         if loop_counter % 60 == 0:
@@ -2951,6 +3047,7 @@ def main(args=None):
                         read_trade_files=True,
                         skip_trade_merge=False,
                         recent_trades_cached=None,
+                        strategies=strategies,
                     )
                     web_dashboard_state_mod.set_snapshot(_snap)
             except Exception as _snap_err:
@@ -2984,8 +3081,6 @@ def main(args=None):
 
                         with market_lock:
                             status = market_start_prices.get(coin_name, {}).get(market_slug, -999)
-                            if status in [-1, -2, -999]:
-                                return
 
                         up_ask = market_state.get('up_ask', 0.5)
                         down_ask = market_state.get('down_ask', 0.5)
@@ -2994,10 +3089,33 @@ def main(args=None):
                         up_ask_ts = market_state.get('up_ask_timestamp', 0)
                         down_ask_ts = market_state.get('down_ask_timestamp', 0)
 
-                        is_valid, reason = validate_prices(
-                            up_ask, down_ask, up_ask_ts, down_ask_ts, coin_name
-                        )
-                        if not is_valid:
+                        stg = strategies.get(strategy_name)
+                        ste_local = int(market_state.get("seconds_till_end") or 0)
+                        if (
+                            stg
+                            and not stg.is_reverse_leg_only(market_slug)
+                            and stg.second_entry_pending(market_slug)
+                            and ste_local > 0
+                        ):
+                            if maybe_second_entry(
+                                config=config,
+                                strategy=stg,
+                                multi_trader=multi_trader,
+                                strategy_name=strategy_name,
+                                market_slug=market_slug,
+                                coin=coin_name,
+                                up_ask=up_ask,
+                                down_ask=down_ask,
+                                market_state=market_state,
+                                data_feed=data_feed,
+                                market_window_prices=market_window_prices,
+                                market_start_prices=market_start_prices,
+                                market_lock=market_lock,
+                                window_range_tracker=window_range_tracker,
+                            ):
+                                return
+
+                        if status in [-1, -2, -999]:
                             return
 
                         detailed_stats = multi_trader.traders[strategy_name].get_market_detailed_stats(
@@ -3007,8 +3125,15 @@ def main(args=None):
                         )
                         if not detailed_stats:
                             return
+                        if detailed_stats.get('total_invested', 0) <= 0:
+                            return
 
-                        stg = strategies.get(strategy_name)
+                        is_valid, reason = validate_prices(
+                            up_ask, down_ask, up_ask_ts, down_ask_ts, coin_name
+                        )
+                        if not is_valid:
+                            return
+
                         if stg and not stg.is_reverse_leg_only(market_slug):
                             up_shares = detailed_stats.get('up_shares', 0)
                             down_shares = detailed_stats.get('down_shares', 0)

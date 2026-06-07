@@ -262,60 +262,146 @@
     return t.close_time || 0;
   }
 
+  function marketGroupKey(t) {
+    return `${t.strategy || ""}\t${t.market_slug || ""}`;
+  }
+
+  function tradeCommonCells(t) {
+    const m = (t.market_slug || "").split("-").pop() || t.market_slug;
+    const sym = t.spot_label || (t.coin || "").toUpperCase() || EM;
+    return {
+      strategy: t.strategy || "",
+      sym,
+      market: m || "",
+      rangeHigh: fmtSpot(t.window_range_high),
+      rangeLow: fmtSpot(t.window_range_low),
+    };
+  }
+
+  function renderTradeLegDetailCells(t) {
+    const pnl = t.pnl_usd != null ? t.pnl_usd : t.pnl;
+    const cls = (pnl ?? 0) >= 0 ? "pnl-pos" : "pnl-neg";
+    const bet =
+      (t.bet_side || EM) + (t.entry_label ? ` · ${t.entry_label}` : "");
+    const entryAsk =
+      t.entry_ask != null
+        ? t.entry_ask
+        : t.token_ask != null
+          ? t.token_ask
+          : null;
+    const askMax =
+      t.first_leg_ask_max != null ? t.first_leg_ask_max : null;
+    const er = (t.entry_reason || "normal").trim();
+    const secondTrigger =
+      er === "second_entry" || er === "flip_reverse"
+        ? EM
+        : t.second_entry_would_trigger_ask === true
+          ? "是"
+          : t.second_entry_would_trigger_ask === false
+            ? "否"
+            : askMax != null
+              ? "否"
+              : EM;
+    const orderUsd = t.size_usd != null ? t.size_usd : t.total_cost;
+    const isOpen = t.is_open === true;
+    const lbl = t.bet_result_label;
+    const settledLbl = lbl === "押中" || lbl === "未中" || lbl === "待结算";
+    const betRes = settledLbl ? lbl : isOpen ? "持仓" : lbl || EM;
+    const exitLbl =
+      isOpen && (!t.exit_label || t.exit_label === EM)
+        ? "持仓中"
+        : t.exit_label || EM;
+    const rowCls = isOpen ? "row-open" : cls;
+    return `
+        <td>${escapeHtml(bet)}</td>
+        <td class="num">${escapeHtml(fmtAsk(entryAsk))}</td>
+        <td class="num">${escapeHtml(askMax != null ? fmtAsk(askMax) : EM)}</td>
+        <td>${escapeHtml(secondTrigger)}</td>
+        <td class="num">${escapeHtml(fmtUsdPlain(orderUsd))}</td>
+        <td class="num">${escapeHtml(fmtSpot(t.spot_at_entry))}</td>
+        <td class="num">${escapeHtml(fmtEntryTime(t))}</td>
+        <td class="num">${escapeHtml(fmtSpot(t.spot_start))}</td>
+        <td class="num">${escapeHtml(fmtSpot(t.spot_end))}</td>
+        <td>${escapeHtml(betRes)}</td>
+        <td>${escapeHtml(exitLbl)}</td>
+        <td class="${rowCls}">${isOpen ? fmtUsd(pnl) + " (浮)" : fmtUsd(pnl)}</td>`;
+  }
+
+  function renderTradeGroupRows(group, isLastGroup) {
+    const legs = group.legs;
+    const multiLeg = legs.length > 1;
+    const common = tradeCommonCells(legs[0]);
+    const rs = legs.length;
+    const groupEndCls = isLastGroup ? "" : " trade-market-group-end";
+    const mergedEndCls = isLastGroup ? "" : " trade-market-group-end";
+    const html = [];
+
+    legs.forEach((t, i) => {
+      const isOpen = t.is_open === true;
+      const openCls = isOpen ? " row-open" : "";
+      const detail = renderTradeLegDetailCells(t);
+      const rowEndCls = i === legs.length - 1 ? groupEndCls : "";
+
+      if (i === 0 && multiLeg) {
+        html.push(`<tr class="trade-market-group${openCls}${rowEndCls}">
+        <td rowspan="${rs}" class="trade-common-merged${mergedEndCls}">${escapeHtml(common.strategy)}</td>
+        <td rowspan="${rs}" class="trade-common-merged${mergedEndCls}">${escapeHtml(common.sym)}</td>
+        <td rowspan="${rs}" class="trade-common-merged${mergedEndCls}">${escapeHtml(common.market)}</td>
+        <td rowspan="${rs}" class="trade-common-merged num${mergedEndCls}">${escapeHtml(common.rangeHigh)}</td>
+        <td rowspan="${rs}" class="trade-common-merged num${mergedEndCls}">${escapeHtml(common.rangeLow)}</td>
+        ${detail}
+      </tr>`);
+      } else if (i === 0) {
+        html.push(`<tr class="${openCls}${rowEndCls}">
+        <td>${escapeHtml(common.strategy)}</td>
+        <td>${escapeHtml(common.sym)}</td>
+        <td>${escapeHtml(common.market)}</td>
+        <td class="num">${escapeHtml(common.rangeHigh)}</td>
+        <td class="num">${escapeHtml(common.rangeLow)}</td>
+        ${detail}
+      </tr>`);
+      } else {
+        html.push(`<tr class="trade-market-group${openCls}${rowEndCls}">${detail}</tr>`);
+      }
+    });
+    return html.join("");
+  }
+
+  function groupTradeRows(rows) {
+    const groups = [];
+    const indexByKey = new Map();
+    for (const t of rows) {
+      const key = marketGroupKey(t);
+      let idx = indexByKey.get(key);
+      if (idx == null) {
+        idx = groups.length;
+        indexByKey.set(key, idx);
+        groups.push({ key, legs: [] });
+      }
+      groups[idx].legs.push(t);
+    }
+    for (const g of groups) {
+      g.legs.sort((a, b) => entrySortKey(a) - entrySortKey(b));
+    }
+    return groups;
+  }
+
   function renderTradeRows(rows) {
     const sig = tradesSignature(rows);
     if (sig === lastTradesSig) {
       return;
     }
     lastTradesSig = sig;
-    tbody.innerHTML = rows
-      .map((t) => {
-        const pnl = t.pnl_usd != null ? t.pnl_usd : t.pnl;
-        const cls = (pnl ?? 0) >= 0 ? "pnl-pos" : "pnl-neg";
-        const m = (t.market_slug || "").split("-").pop() || t.market_slug;
-        const sym = t.spot_label || (t.coin || "").toUpperCase() || EM;
-        const bet =
-          (t.bet_side || EM) +
-          (t.entry_label ? ` · ${t.entry_label}` : "");
-        const entryAsk =
-          t.entry_ask != null
-            ? t.entry_ask
-            : t.token_ask != null
-              ? t.token_ask
-              : null;
-        const orderUsd = t.size_usd != null ? t.size_usd : t.total_cost;
-        const isOpen = t.is_open === true;
-        const lbl = t.bet_result_label;
-        const settledLbl =
-          lbl === "押中" || lbl === "未中" || lbl === "待结算";
-        const betRes = settledLbl ? lbl : isOpen ? "持仓" : lbl || EM;
-        const exitLbl =
-          isOpen && (!t.exit_label || t.exit_label === EM)
-            ? "持仓中"
-            : t.exit_label || EM;
-        const rowCls = isOpen ? "row-open" : cls;
-        return `<tr class="${isOpen ? "row-open" : ""}">
-        <td>${escapeHtml(t.strategy || "")}</td>
-        <td>${escapeHtml(sym)}</td>
-        <td>${escapeHtml(m || "")}</td>
-        <td>${escapeHtml(bet)}</td>
-        <td class="num">${escapeHtml(fmtAsk(entryAsk))}</td>
-        <td class="num">${escapeHtml(fmtUsdPlain(orderUsd))}</td>
-        <td class="num">${escapeHtml(fmtSpot(t.spot_at_entry))}</td>
-        <td class="num">${escapeHtml(fmtSpot(t.window_range_high))}</td>
-        <td class="num">${escapeHtml(fmtSpot(t.window_range_low))}</td>
-        <td class="num">${escapeHtml(fmtEntryTime(t))}</td>
-        <td class="num">${escapeHtml(fmtSpot(t.spot_start))}</td>
-        <td class="num">${escapeHtml(fmtSpot(t.spot_end))}</td>
-        <td>${escapeHtml(betRes)}</td>
-        <td>${escapeHtml(exitLbl)}</td>
-        <td class="${rowCls}">${isOpen ? fmtUsd(pnl) + " (浮)" : fmtUsd(pnl)}</td>
-      </tr>`;
-      })
-      .join("");
     if (!rows.length) {
-      tbody.innerHTML = '<tr><td colspan="15">暂无交易记录（下单后会显示持仓行）</td></tr>';
+      tbody.innerHTML =
+        '<tr><td colspan="17">暂无交易记录（下单后会显示持仓行）</td></tr>';
+      return;
     }
+
+    const groups = groupTradeRows(rows);
+    tbody.innerHTML = groups
+      .map((group, gi) => renderTradeGroupRows(group, gi === groups.length - 1))
+      .join("");
   }
 
   function updatePagerUi(meta) {

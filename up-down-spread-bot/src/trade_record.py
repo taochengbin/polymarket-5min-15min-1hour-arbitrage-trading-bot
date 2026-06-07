@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 ENTRY_REASON_LABELS: Dict[str, str] = {
     "normal": "",
     "flip_reverse": "翻转补单",
+    "second_entry": "第二单",
     "recovery": "回补",
 }
 
@@ -110,6 +111,9 @@ def build_open_record(
         "price_source": "pending",
         "entry_reason": er,
         "entry_label": entry_label_for(er),
+        "first_leg_ask_max": None,
+        "second_entry_ask_threshold": None,
+        "second_entry_would_trigger_ask": None,
         "window_range_high": (
             round(float(window_range_high), 2)
             if window_range_high is not None and float(window_range_high) > 0
@@ -122,6 +126,35 @@ def build_open_record(
         ),
     }
     return rec
+
+
+def apply_first_leg_ask_analytics(
+    record: Dict[str, Any],
+    *,
+    first_leg_ask_max: float,
+    second_entry_ask_threshold: float = 0,
+    hedge_ask_min: Optional[float] = None,
+    hedge_ask_threshold: float = 0,
+) -> None:
+    """Stamp first-leg direction ask peak (live ask after first fill → window end)."""
+    er = (record.get("entry_reason") or "normal").strip()
+    if er in ("second_entry", "flip_reverse"):
+        return
+    if first_leg_ask_max and float(first_leg_ask_max) > 0:
+        record["first_leg_ask_max"] = round(float(first_leg_ask_max), 4)
+    thr = float(second_entry_ask_threshold or 0)
+    record["second_entry_ask_threshold"] = round(thr, 4) if thr > 0 else None
+    hthr = float(hedge_ask_threshold or 0)
+    if hthr <= 0 and thr > 0:
+        hthr = max(0.01, round(1.0 - thr, 4))
+    if hthr > 0:
+        record["second_entry_hedge_ask_threshold"] = round(hthr, 4)
+    if hedge_ask_min is not None and float(hedge_ask_min) > 0:
+        record["second_entry_hedge_ask_min"] = round(float(hedge_ask_min), 4)
+    if hedge_ask_min is not None and hthr > 0:
+        record["second_entry_would_trigger_ask"] = bool(
+            float(hedge_ask_min) < hthr
+        )
 
 
 def refresh_open_unrealized(

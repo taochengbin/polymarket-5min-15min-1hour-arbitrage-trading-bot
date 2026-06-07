@@ -136,6 +136,21 @@ tr.row-open td {
   background: rgba(99, 179, 237, 0.07);
 }
 
+#recent-trades td.trade-common-merged {
+  color: var(--text);
+  font-weight: 600;
+  vertical-align: middle;
+}
+
+#recent-trades tr.row-open td.trade-common-merged {
+  background: rgba(99, 179, 237, 0.07);
+}
+
+#recent-trades tr.trade-market-group-end td,
+#recent-trades td.trade-common-merged.trade-market-group-end {
+  border-bottom: 3px solid rgba(139, 156, 179, 0.55);
+}
+
 .grid-4 {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));

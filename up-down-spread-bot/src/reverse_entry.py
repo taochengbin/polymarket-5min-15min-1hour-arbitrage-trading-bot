@@ -25,7 +25,7 @@ def _position_has_flip_reverse(trader: Any, market_slug: str) -> bool:
     with trader.lock:
         pos = trader.positions.get(market_slug) or {}
         for ent in pos.get("all_entries") or []:
-            if (ent.get("entry_reason") or "") == "flip_reverse":
+            if (ent.get("entry_reason") or "") in ("flip_reverse", "second_entry"):
                 return True
     return False
 

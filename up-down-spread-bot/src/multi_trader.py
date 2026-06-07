@@ -188,7 +188,60 @@ class MultiTrader:
         except Exception as e:
             print(f"[ERROR] {strategy_name} early exit failed: {e}")
             return None
+
+    def close_first_leg_flip_stop(
+        self,
+        strategy_name: str,
+        market_slug: str,
+        leg_side: str,
+        exit_price: float,
+        up_bid: float = None,
+        down_bid: float = None,
+        skip_exchange_sell: bool = False,
+        parallel_sell_results=None,
+    ) -> Optional[Dict]:
+        """Flip-stop first leg only; second_entry remains open."""
+        if strategy_name not in self.traders:
+            print(f"[ERROR] Unknown strategy: {strategy_name}")
+            return None
+        try:
+            return self.traders[strategy_name].close_first_leg_flip_stop(
+                market_slug=market_slug,
+                leg_side=leg_side,
+                exit_price=exit_price,
+                up_bid=up_bid,
+                down_bid=down_bid,
+                skip_exchange_sell=skip_exchange_sell,
+                parallel_sell_results=parallel_sell_results,
+            )
+        except Exception as e:
+            print(f"[ERROR] {strategy_name} first-leg flip-stop failed: {e}")
+            return None
     
+    def persist_first_leg_ask_max(
+        self,
+        strategy_name: str,
+        market_slug: str,
+        first_leg_ask_max: float,
+        *,
+        second_entry_ask_threshold: float = 0,
+        hedge_ask_min: Optional[float] = None,
+        hedge_ask_threshold: float = 0,
+    ) -> int:
+        if strategy_name not in self.traders:
+            return 0
+        try:
+            return self.traders[strategy_name].persist_first_leg_ask_max(
+                market_slug,
+                first_leg_ask_max,
+                second_entry_ask_threshold=second_entry_ask_threshold,
+                hedge_ask_min=hedge_ask_min,
+                hedge_ask_threshold=hedge_ask_threshold,
+            )
+        except Exception as e:
+            print(f"[ERROR] persist_first_leg_ask_max failed: {e}")
+            return 0
+
     def get_trader(self, strategy_name: str) -> Optional[Trader]:
         """Get specific trader instance"""
         return self.traders.get(strategy_name)

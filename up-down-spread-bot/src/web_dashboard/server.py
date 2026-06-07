@@ -286,6 +286,8 @@ def create_app(project_root: Path | None = None) -> Flask:
                 market_window_prices=ctx.get("market_windows"),
                 delay_sec=0.0,
                 limit=limit,
+                strategies=ctx.get("strategies"),
+                strategy_bases=ctx.get("strategy_bases"),
             )
             refresh = ctx.get("refresh_trades")
             if callable(refresh):

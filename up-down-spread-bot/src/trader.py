@@ -677,7 +677,7 @@ class Trader:
         """Per-entry row: only this leg's shares/cost (not whole hedge position)."""
         er = (entry_reason or "normal").strip() or "normal"
         c = round(float(contracts), 4)
-        if er == "flip_reverse":
+        if er == "flip_reverse" or er == "second_entry":
             up_sh = c if side == "UP" else 0.0
             down_sh = c if side == "DOWN" else 0.0
             return up_sh, down_sh
@@ -951,11 +951,97 @@ class Trader:
             if not pos or pos.get("status") == "CLOSED":
                 return False
             for ent in pos.get("all_entries") or []:
-                if ent.get("entry_reason") == "flip_reverse":
+                if (ent.get("entry_reason") or "") in ("flip_reverse", "second_entry"):
                     return False
             up_sh = float(pos.get("UP", {}).get("total_shares") or 0)
             down_sh = float(pos.get("DOWN", {}).get("total_shares") or 0)
             return up_sh > 0 or down_sh > 0
+
+    def has_open_second_entry(self, market_slug: str) -> bool:
+        """True if market has an open second_entry leg (hold to settlement)."""
+        with self.lock:
+            pos = self.positions.get(market_slug)
+            if not pos or pos.get("status") == "CLOSED":
+                return False
+            return any(
+                (ent.get("entry_reason") or "") == "second_entry"
+                for ent in (pos.get("all_entries") or [])
+            )
+
+    def _pop_first_leg_open_records(self, market_slug: str) -> List[Dict]:
+        """Remove open trade rows for first leg only; keep second_entry rows."""
+        keys = self._record_keys_for_slug(market_slug)
+        trades: List[Dict] = []
+        for k in keys:
+            rec = self.open_trade_records.get(k)
+            if not rec:
+                continue
+            er = (rec.get("entry_reason") or "normal").strip()
+            if er in ("second_entry", "flip_reverse"):
+                continue
+            t = self.open_trade_records.pop(k, None)
+            if t is not None:
+                trades.append(t)
+        return trades
+
+    def persist_first_leg_ask_max(
+        self,
+        market_slug: str,
+        first_leg_ask_max: float,
+        *,
+        second_entry_ask_threshold: float = 0,
+        hedge_ask_min: Optional[float] = None,
+        hedge_ask_threshold: float = 0,
+    ) -> int:
+        """
+        Write first-leg ask peak and hedge ask min onto normal entry trade rows.
+        Returns number of rows updated.
+        """
+        from trade_record import apply_first_leg_ask_analytics
+
+        mx = float(first_leg_ask_max or 0)
+        hmin = float(hedge_ask_min) if hedge_ask_min is not None else None
+        if mx <= 0 and not (hmin is not None and hmin > 0):
+            return 0
+        thr = float(second_entry_ask_threshold or 0)
+        hthr = float(hedge_ask_threshold or 0)
+        patched: List[Dict] = []
+        slug = str(market_slug or "")
+
+        for row in self.closed_trades:
+            if str(row.get("market_slug") or "") != slug:
+                continue
+            apply_first_leg_ask_analytics(
+                row,
+                first_leg_ask_max=mx,
+                second_entry_ask_threshold=thr,
+                hedge_ask_min=hmin,
+                hedge_ask_threshold=hthr,
+            )
+            patched.append(row)
+
+        for row in self.open_trade_records.values():
+            if str(row.get("market_slug") or "") != slug:
+                continue
+            apply_first_leg_ask_analytics(
+                row,
+                first_leg_ask_max=mx,
+                second_entry_ask_threshold=thr,
+                hedge_ask_min=hmin,
+                hedge_ask_threshold=hthr,
+            )
+            if row not in patched:
+                patched.append(row)
+
+        if patched:
+            self.rewrite_trade_records_file(patched)
+            try:
+                from trade_storage import sync_trader_records_to_db
+
+                sync_trader_records_to_db(self, patched)
+            except Exception:
+                pass
+        return len(patched)
 
     def snapshot_flip_position(self, market_slug: str) -> Optional[Dict]:
         """Snapshot open leg sizes before parallel flip sell (+ optional reverse buy)."""
@@ -1058,8 +1144,10 @@ class Trader:
             return True  # Success, just didn't enter anything
 
         with self.lock:
-            if market_slug in self.closed_markets:
+            if market_slug in self.closed_markets and entry_reason != "second_entry":
                 return False
+            if market_slug in self.closed_markets and entry_reason == "second_entry":
+                self.closed_markets.discard(market_slug)
             if market_slug in self._enter_in_flight:
                 return False
             if entry_reason == "normal":
@@ -1161,7 +1249,10 @@ class Trader:
                 pos0 = self.positions.get(market_slug)
                 if pos0:
                     for ent in pos0.get("all_entries") or []:
-                        if (ent.get("entry_reason") or "normal") != "flip_reverse":
+                        if (ent.get("entry_reason") or "normal") not in (
+                            "flip_reverse",
+                            "second_entry",
+                        ):
                             if float(ent.get("shares") or 0) > 0:
                                 mem_has_normal = True
                                 break
@@ -1240,7 +1331,9 @@ class Trader:
         
         with self.lock:
             if market_slug in self.closed_markets and actual_contracts <= 0:
-                return False
+                if (entry_reason or "") != "second_entry":
+                    return False
+                self.closed_markets.discard(market_slug)
             if market_slug in self.closed_markets and actual_contracts > 0:
                 print(
                     f"[TRADER] ⚠ Market {market_slug} marked closed but recording "
@@ -1612,7 +1705,140 @@ class Trader:
             print(f"[TRADER] ⚠ Failed to reset market tracking: {reset_err}")
         
         return trade
-    
+
+    def close_first_leg_flip_stop(
+        self,
+        market_slug: str,
+        leg_side: str,
+        exit_price: float,
+        up_bid: float = None,
+        down_bid: float = None,
+        skip_exchange_sell: bool = False,
+        parallel_sell_results: Optional[Dict] = None,
+    ) -> Optional[Dict]:
+        """
+        Flip-stop on first leg only while second_entry leg stays open to settlement.
+        """
+        leg = (leg_side or "").upper()
+        if leg not in ("UP", "DOWN"):
+            return None
+
+        leg_cost = 0.0
+        pnl = 0.0
+        trade: Optional[Dict] = None
+
+        with self.lock:
+            if market_slug not in self.positions:
+                return None
+
+            pos = self.positions[market_slug]
+            has_second = any(
+                (ent.get("entry_reason") or "") == "second_entry"
+                for ent in (pos.get("all_entries") or [])
+            )
+            if not has_second:
+                return None
+
+            contracts = float(pos[leg]["total_shares"] or 0)
+            leg_cost = float(pos[leg]["total_invested"] or 0)
+            if contracts <= 0 or leg_cost <= 0:
+                return None
+
+            bid = up_bid if leg == "UP" else down_bid
+            if bid is None:
+                bid = float(exit_price) if leg == "UP" else float(1.0 - exit_price)
+
+            payout = contracts * float(bid)
+            pnl = payout - leg_cost
+            roi_pct = (pnl / leg_cost * 100) if leg_cost > 0 else 0.0
+
+            open_rows = self._pop_first_leg_open_records(market_slug)
+            if not open_rows:
+                return None
+
+            from trade_record import finalize_early_exit
+
+            closed_rows: List[Dict] = []
+            for row in open_rows:
+                row_cost = float(row.get("total_cost") or row.get("size_usd") or leg_cost)
+                row_pnl = pnl * (row_cost / leg_cost) if leg_cost > 0 else pnl
+                finalize_early_exit(
+                    row,
+                    exit_reason="flip_stop",
+                    pnl=row_pnl,
+                    payout=row_cost + row_pnl,
+                )
+                row["exit_position_side"] = leg
+                row["exit_price"] = float(exit_price)
+                row["roi_pct"] = (
+                    (row_pnl / row_cost * 100) if row_cost > 0 else roi_pct
+                )
+                closed_rows.append(row)
+
+            trade = closed_rows[0]
+
+            try:
+                for row in closed_rows:
+                    self.closed_trades.append(row)
+                self.rewrite_trade_records_file(closed_rows)
+            except Exception as e:
+                print(f"[TRADER] ⚠️ FAILED first-leg flip-stop {market_slug}: {e}")
+                for row in closed_rows:
+                    rk = row.get("record_key")
+                    if rk:
+                        self.open_trade_records[rk] = row
+                return None
+
+            pos[leg] = {"entries": [], "total_invested": 0.0, "total_shares": 0.0}
+            pos["all_entries"] = [
+                ent
+                for ent in (pos.get("all_entries") or [])
+                if (ent.get("entry_reason") or "") == "second_entry"
+            ]
+            self.current_capital += pnl
+
+        if (
+            trade
+            and _order_executor
+            and market_slug in _token_ids_cache
+            and skip_exchange_sell
+            and parallel_sell_results
+        ):
+            leg_result = parallel_sell_results.get(leg)
+            if leg_result and leg_result.success:
+                real_payout = float(leg_result.total_spent_usd or 0)
+                real_pnl = real_payout - leg_cost
+                with self.lock:
+                    trade["payout"] = real_payout
+                    trade["pnl"] = real_pnl
+                    trade["roi_pct"] = (
+                        (real_pnl / leg_cost * 100) if leg_cost > 0 else 0.0
+                    )
+                    if self.closed_trades:
+                        last = self.closed_trades[-1]
+                        if last.get("market_slug") == market_slug:
+                            last.update(
+                                {
+                                    "payout": trade["payout"],
+                                    "pnl": trade["pnl"],
+                                    "roi_pct": trade["roi_pct"],
+                                }
+                            )
+                    self.current_capital += real_pnl - pnl
+                self.rewrite_trade_records_file([trade])
+
+        if not trade:
+            return None
+
+        print(
+            f"[TRADER] 🛑 FIRST-LEG FLIP-STOP {market_slug} {leg} @ ${exit_price:.2f}: "
+            f"{trade.get('pnl', pnl):+.2f} | second_entry leg held to settlement"
+        )
+        out = dict(trade)
+        out["second_leg_held"] = True
+        out["closed_leg"] = leg
+        return out
+
     def close_market_early_exit(self, market_slug: str, exit_price: float, exit_reason: str = 'early_exit',
                                 up_bid: float = None, down_bid: float = None,
                                 keep_market_open_for_reentry: bool = False,
@@ -2264,11 +2490,15 @@ class Trader:
             flip_cfg = self.config.get('exit', {}).get('flip_stop', {})
             max_spot_dist = float(flip_cfg.get('max_spot_distance_from_open_usd', 0) or 0)
             pos_flip = self.positions.get(market_slug) or {}
+            up_sh = float(pos_flip.get("UP", {}).get("total_shares") or 0)
+            down_sh = float(pos_flip.get("DOWN", {}).get("total_shares") or 0)
             target = resolve_flip_stop_target(
                 flip_cfg=flip_cfg,
                 up_ask=up_ask,
                 down_ask=down_ask,
                 all_entries=pos_flip.get("all_entries") or [],
+                up_shares=up_sh,
+                down_shares=down_sh,
             )
             if target:
                 our_side = target["side"]

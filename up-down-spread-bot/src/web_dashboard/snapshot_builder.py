@@ -695,6 +695,13 @@ def _trim_rows_for_web(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "market_slug": t.get("market_slug"),
                 "bet_side": t.get("bet_side") or "—",
                 "entry_ask": round(float(t.get("entry_ask") or t.get("token_ask") or 0), 4) or None,
+                "first_leg_ask_max": (
+                    round(float(t.get("first_leg_ask_max")), 4)
+                    if t.get("first_leg_ask_max") is not None
+                    else None
+                ),
+                "second_entry_ask_threshold": t.get("second_entry_ask_threshold"),
+                "second_entry_would_trigger_ask": t.get("second_entry_would_trigger_ask"),
                 "size_usd": round(float(t.get("size_usd") or t.get("total_cost") or 0), 2) or None,
                 "up_ask_at_entry": t.get("up_ask_at_entry"),
                 "down_ask_at_entry": t.get("down_ask_at_entry"),
@@ -721,6 +728,29 @@ def _trim_rows_for_web(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def _merge_live_first_leg_ask_max(
+    rows: List[Dict[str, Any]], strategies: Optional[Dict[str, Any]] = None
+) -> None:
+    """Overlay in-memory first-leg direction ask peak while market is still open."""
+    if not strategies:
+        return
+    for row in rows:
+        er = (row.get("entry_reason") or "normal").strip()
+        if er in ("second_entry", "flip_reverse"):
+            continue
+        slug = str(row.get("market_slug") or "")
+        sn = str(row.get("strategy") or "")
+        stg = strategies.get(sn)
+        if not stg or not slug:
+            continue
+        live = stg.get_first_leg_ask_max(slug)
+        if live is None or float(live) <= 0:
+            continue
+        stored = row.get("first_leg_ask_max")
+        if stored is None or float(live) > float(stored):
+            row["first_leg_ask_max"] = round(float(live), 4)
+
+
 def build_recent_trades_trimmed(
     *,
     multi_trader,
@@ -731,6 +761,7 @@ def build_recent_trades_trimmed(
     market_starts: Optional[Dict[str, Dict[str, float]]] = None,
     read_trade_files: bool = True,
     limit: int = 40,
+    strategies: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Merge memory + MySQL into web table rows."""
     recent = _merge_trade_rows(
@@ -743,6 +774,7 @@ def build_recent_trades_trimmed(
         limit=limit,
         read_trade_files=read_trade_files,
     )
+    _merge_live_first_leg_ask_max(recent, strategies)
     _apply_display_labels(recent)
     return _trim_rows_for_web(recent)
 
@@ -920,6 +952,7 @@ def build_snapshot(
     read_trade_files: bool = True,
     skip_trade_merge: bool = False,
     recent_trades_cached: Optional[List[Dict[str, Any]]] = None,
+    strategies: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     now = time.time()
     uptime = now - session_start_time
@@ -1027,6 +1060,7 @@ def build_snapshot(
             market_starts=market_starts,
             read_trade_files=read_trade_files,
             limit=40,
+            strategies=strategies,
         )
 
     strat_cfg = config.get("strategy", {})

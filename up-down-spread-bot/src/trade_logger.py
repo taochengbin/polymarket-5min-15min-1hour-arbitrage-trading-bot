@@ -172,6 +172,41 @@ def log_reverse_entry_trigger(
     trades_logger.warning(" | ".join(msg_parts))
 
 
+def log_second_entry_trigger(
+    market_slug: str,
+    coin: str = None,
+    first_leg_side: str = None,
+    trigger_price: float = None,
+    threshold_price: float = None,
+    reverse_side: str = None,
+    reverse_ask: float = None,
+    spot_open: float = None,
+    spot_now: float = None,
+    max_spot_distance: float = None,
+):
+    """Log high-ask second entry (opposite side hedge)."""
+    msg_parts = [f"SECOND_ENTRY_TRIGGER | Market: {market_slug}"]
+    if coin:
+        msg_parts.append(f"Coin: {coin.upper()}")
+    if first_leg_side:
+        msg_parts.append(f"FirstLeg: {first_leg_side}")
+    if trigger_price is not None:
+        msg_parts.append(f"FirstLegAsk: ${trigger_price:.2f}")
+    if threshold_price is not None:
+        msg_parts.append(f"HedgeMaxAsk: ${threshold_price:.2f}")
+    if reverse_side:
+        msg_parts.append(f"Hedge: {reverse_side}")
+    if reverse_ask is not None:
+        msg_parts.append(f"HedgeAsk: ${reverse_ask:.2f}")
+    if spot_open is not None:
+        msg_parts.append(f"SpotOpen: ${spot_open:.2f}")
+    if spot_now is not None:
+        msg_parts.append(f"SpotNow: ${spot_now:.2f}")
+    if max_spot_distance is not None:
+        msg_parts.append(f"MaxSpotDist: ${max_spot_distance:.0f}")
+    trades_logger.warning(" | ".join(msg_parts))
+
+
 def log_market_closing_blocked(market_slug: str, blocked_at: str):
     """
     🔥 NEW: Log race condition protection - blocked buy orders

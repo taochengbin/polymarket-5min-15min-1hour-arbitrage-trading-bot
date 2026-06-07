@@ -24,6 +24,8 @@ def settle_one_market(
     market_window_prices: Optional[Dict[str, Dict[str, Dict[str, float]]]] = None,
     delay_sec: float = 0.0,
     max_wait: float = 60.0,
+    strategies: Optional[Dict[str, Any]] = None,
+    strategy_bases: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Fetch official settlement and update trade record + position if any."""
     out: Dict[str, Any] = {
@@ -93,6 +95,17 @@ def settle_one_market(
                 pw["price_source"] = "chainlink"
             pw["updated_at"] = time.time()
             market_window_prices.setdefault(coin, {})[market_slug] = pw
+
+        if strategies and strategy_bases:
+            from first_leg_ask_analytics import flush_first_leg_ask_analytics
+
+            flush_first_leg_ask_analytics(
+                coin=coin,
+                slug=market_slug,
+                strategies=strategies,
+                multi_trader=multi_trader,
+                strategy_bases=strategy_bases,
+            )
 
         if market_slug in trader.positions:
             result = multi_trader.close_market(
@@ -242,7 +255,9 @@ def collect_pending_settlements(
 
         cfg = getattr(tr, "config", None)
         if db_reads_enabled(cfg):
-            for raw in load_persisted_records(tr, pending_only=True, limit=0, config=cfg):
+            # Load all persisted rows — pending_only only matches is_open=1 and misses
+            # closed rows that still need Chainlink/Gamma settlement.
+            for raw in load_persisted_records(tr, pending_only=False, limit=0, config=cfg):
                 slug = str(raw.get("market_slug") or "")
                 if not slug or not _slug_needs_chainlink_fill(raw):
                     continue
@@ -285,6 +300,8 @@ def settle_all_pending(
     market_window_prices: Optional[Dict[str, Dict[str, Dict[str, float]]]] = None,
     delay_sec: float = 0.0,
     limit: Optional[int] = None,
+    strategies: Optional[Dict[str, Any]] = None,
+    strategy_bases: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Settle pending slugs (newest first); optional cap via limit."""
     items, pending_total = collect_pending_settlements(
@@ -303,6 +320,8 @@ def settle_all_pending(
             lock_chainlink_window=lock_chainlink_window,
             market_window_prices=market_window_prices,
             delay_sec=delay_sec,
+            strategies=strategies,
+            strategy_bases=strategy_bases,
         )
         results.append(r)
         if r.get("success"):
